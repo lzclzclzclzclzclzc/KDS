@@ -55,6 +55,8 @@ def _clean_config(payload: dict) -> tuple[str, dict]:
         "round_robin_order": payload.get("round_robin_order") or [],
         "scheduler_params": payload.get("scheduler_params") or {},
     }
+    if config["total_max_tokens"] is None and config["total_duration_seconds"] is None:
+        raise ValueError("总输出 max_token 和总对话时长不能同时为无限，至少设置一个")
     return name, config
 
 
@@ -141,6 +143,8 @@ def conversations_create():
         return _err("找不到对应的配置，请先保存配置")
     if len(config.get("agents", [])) < 2:
         return _err("至少需要 2 个角色才能开始群聊")
+    if not config.get("total_max_tokens") and not config.get("total_duration_seconds"):
+        return _err("总输出 max_token 和总对话时长不能同时为无限，至少设置一个")
 
     conv_id = uuid.uuid4().hex
     name = payload.get("name") or config.get("name", "对话")

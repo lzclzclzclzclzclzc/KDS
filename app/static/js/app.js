@@ -350,6 +350,7 @@
           <input id="cfg-duration" type="number" value="${
             draft.total_duration_seconds == null ? "" : draft.total_duration_seconds
           }" placeholder="留空表示不限" />
+          <div class="hint">总输出 max_token 和总时长不能同时留空（至少设置一个）。</div>
         </div>
         <div class="field">
           <label>首个发言人</label>
@@ -556,7 +557,21 @@
     return JSON.parse(JSON.stringify(draft));
   }
 
+  function validateLimits() {
+    const t = draft.total_max_tokens;
+    const d = draft.total_duration_seconds;
+    if (!t && !d) {
+      return "总输出 max_token 和总对话时长不能同时为无限，至少设置一个";
+    }
+    return null;
+  }
+
   async function saveConfig() {
+    const limitError = validateLimits();
+    if (limitError) {
+      toast(limitError);
+      return;
+    }
     try {
       const payload = serializeDraft();
       if (configId) {
@@ -578,6 +593,11 @@
   }
 
   async function startChat() {
+    const limitError = validateLimits();
+    if (limitError) {
+      toast(limitError);
+      return;
+    }
     try {
       const payload = serializeDraft();
       let id = configId;
