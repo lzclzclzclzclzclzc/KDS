@@ -5,6 +5,7 @@ import traceback
 from datetime import datetime, timezone
 from typing import Optional
 
+from app.config import DEFAULT_SINGLE_MAX_TOKENS
 from app.db import update_conversation
 from app.llm import LLMClient
 from app.scheduler import update_heat, willingness_select
@@ -26,10 +27,10 @@ def _derive_single_max_tokens(config: dict) -> int:
                 continue
     if values and len(set(values)) == 1:
         return values[0]
-    return 300
+    return DEFAULT_SINGLE_MAX_TOKENS
 
 
-def _normalize_agents(agents: list[dict], single_max_tokens: int = 300) -> list[dict]:
+def _normalize_agents(agents: list[dict], single_max_tokens: int = DEFAULT_SINGLE_MAX_TOKENS) -> list[dict]:
     normalized = []
     for i, a in enumerate(agents):
         item = dict(a)
@@ -440,9 +441,16 @@ class ConversationRunner:
                     self._interrupt_requested = False
                 self._persist()
         except Exception as exc:  # pragma: no cover - defensive
+            # Pause recoverably instead of terminally erroring, so a transient
+            # LLM failure doesn't kill the whole conversation. resume() only
+            # blocks paused_reason=="limit", and summarize_now() accepts any
+            # paused state, so the user can retry or summarize afterwards.
+            self._pause_segment()
             with self._lock:
                 self.error = f"{exc}\n{traceback.format_exc()}"
-                self.status = "error"
+                self.status = "paused"
+                self.paused_reason = "error"
+                self._interrupt_requested = False
             self._persist()
 
     def _finish(self, status: str, reason: Optional[str] = None) -> None:

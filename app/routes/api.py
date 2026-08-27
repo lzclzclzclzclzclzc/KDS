@@ -3,6 +3,7 @@ import uuid
 from flask import Blueprint, jsonify, render_template, request
 
 from app.assistant import AssistantManager
+from app.config import DEFAULT_SINGLE_MAX_TOKENS
 from app.db import (
     create_config,
     create_conversation,
@@ -44,7 +45,7 @@ def _clean_config(payload: dict) -> tuple[str, dict]:
                 "visibility": a.get("visibility") or [],
             }
         )
-    single_max_tokens = int(payload.get("single_max_tokens") or 300)
+    single_max_tokens = int(payload.get("single_max_tokens") or DEFAULT_SINGLE_MAX_TOKENS)
     if single_max_tokens <= 0:
         raise ValueError("单人 max_token 必须大于 0")
     config = {
@@ -154,7 +155,7 @@ def conversations_create():
     config_payload = {
         "agents": config.get("agents", []),
         "shared_background": config.get("shared_background", ""),
-        "single_max_tokens": config.get("single_max_tokens") or 300,
+        "single_max_tokens": config.get("single_max_tokens") or DEFAULT_SINGLE_MAX_TOKENS,
         "total_max_tokens": config.get("total_max_tokens"),
         "total_duration_seconds": config.get("total_duration_seconds"),
         "first_speaker": config.get("first_speaker"),
