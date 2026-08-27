@@ -148,7 +148,7 @@ class LLMClient:
         self,
         messages: list[dict],
         temperature: float,
-        max_tokens: int,
+        max_tokens: Optional[int],
         json_mode: bool = False,
     ) -> tuple[str, dict]:
         if self._client is None:
@@ -157,8 +157,10 @@ class LLMClient:
             "model": self.model,
             "messages": messages,
             "temperature": temperature,
-            "max_tokens": max_tokens,
         }
+        # max_tokens=None means "no cap" — omit it so the model uses its default max.
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
         try:
@@ -266,7 +268,7 @@ class LLMClient:
     def assist(self, messages: list[dict]) -> tuple[str, dict]:
         if self.mock:
             return self._mock_assist(messages)
-        content, usage = self._call(messages, 0.3, max_tokens=1800, json_mode=True)
+        content, usage = self._call(messages, 0.3, max_tokens=None, json_mode=True)
         return content, usage
 
     # ---- Mock helpers ----

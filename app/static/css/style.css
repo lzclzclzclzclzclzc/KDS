@@ -241,6 +241,19 @@ select {
   box-shadow: var(--shadow-sm);
 }
 
+.list-item .list-delete {
+  flex: none;
+  padding: 4px 10px;
+  font-size: 13px;
+  color: var(--text-3);
+  border-radius: 8px;
+}
+
+.list-item .list-delete:hover {
+  color: #d64545;
+  background: rgba(214, 69, 69, 0.1);
+}
+
 .list-item .thumb {
   width: 38px;
   height: 38px;
@@ -658,6 +671,26 @@ select {
 
 .chat-footer input:focus {
   border-color: var(--primary);
+}
+
+.chat-footer .chat-target {
+  flex: none;
+  max-width: 40%;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 22px;
+  background: var(--surface);
+  outline: none;
+  cursor: pointer;
+}
+
+.chat-footer .chat-target:focus {
+  border-color: var(--primary);
+}
+
+.chat-footer .chat-target:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
 .toast {

@@ -48,6 +48,22 @@ def _clean_config(payload: dict) -> tuple[str, dict]:
     single_max_tokens = int(payload.get("single_max_tokens") or DEFAULT_SINGLE_MAX_TOKENS)
     if single_max_tokens <= 0:
         raise ValueError("单人 max_token 必须大于 0")
+
+    end_vote_enabled = bool(payload.get("end_vote_enabled"))
+    raw_proposers = payload.get("end_vote_proposers") or []
+    if not isinstance(raw_proposers, list):
+        raise ValueError("可发起结束投票的角色必须是数组")
+    valid_ids = {a["id"] for a in cleaned_agents} | {a["name"] for a in cleaned_agents}
+    end_vote_proposers = [str(p) for p in raw_proposers if str(p) in valid_ids]
+    if end_vote_enabled and not end_vote_proposers:
+        raise ValueError("启用主动结束投票时，至少需要选定一个可发起的角色")
+    try:
+        end_vote_cooldown_turns = int(payload.get("end_vote_cooldown_turns") or 3)
+    except (TypeError, ValueError):
+        end_vote_cooldown_turns = 3
+    if end_vote_cooldown_turns < 0:
+        end_vote_cooldown_turns = 0
+
     config = {
         "shared_background": payload.get("shared_background") or "",
         "agents": cleaned_agents,
@@ -58,6 +74,9 @@ def _clean_config(payload: dict) -> tuple[str, dict]:
         "scheduling_mode": payload.get("scheduling_mode") or "round_robin",
         "round_robin_order": payload.get("round_robin_order") or [],
         "scheduler_params": payload.get("scheduler_params") or {},
+        "end_vote_enabled": end_vote_enabled,
+        "end_vote_proposers": end_vote_proposers,
+        "end_vote_cooldown_turns": end_vote_cooldown_turns,
     }
     if config["total_max_tokens"] is None and config["total_duration_seconds"] is None:
         raise ValueError("总输出 max_token 和总对话时长不能同时为无限，至少设置一个")
@@ -162,6 +181,9 @@ def conversations_create():
         "scheduling_mode": config.get("scheduling_mode"),
         "round_robin_order": config.get("round_robin_order", []),
         "scheduler_params": config.get("scheduler_params", {}),
+        "end_vote_enabled": config.get("end_vote_enabled", False),
+        "end_vote_proposers": config.get("end_vote_proposers", []),
+        "end_vote_cooldown_turns": config.get("end_vote_cooldown_turns", 3),
     }
     runner = ConversationRunner(conv_id, config_id, name, config_payload, _llm)
     initial = runner.to_dict()
@@ -229,9 +251,16 @@ def conversations_reserve(conv_id):
         record = get_conversation(conv_id)
         if record is None:
             return _err("对话不存在", 404)
+        if record.get("status") != "paused":
+            return _err("该对话已结束，无法再发言", 409)
+        runner = ConversationRunner.from_payload(record, _llm)
+        RUNNERS[conv_id] = runner
+    raw_target = payload.get("target")
+    target = str(raw_target) if raw_target else None
+    result = runner.human_say(content, target=target)
+    if result is None:
         return _err("该对话已结束，无法再发言", 409)
-    runner.reserve(content)
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "mode": result})
 
 
 @api_bp.post("/api/conversations/<conv_id>/interrupt")
@@ -257,6 +286,48 @@ def conversations_resume(conv_id):
     if not runner.resume():
         return _err("该对话当前无法恢复（可能已结束或正在运行）", 409)
     return jsonify({"ok": True, "status": runner.to_dict()["status"]})
+
+
+@api_bp.post("/api/conversations/<conv_id>/limits")
+def conversations_update_limits(conv_id):
+    payload = request.get_json(silent=True) or {}
+
+    def _parse_limit(key):
+        raw = payload.get(key)
+        if raw in (None, "", 0, "0"):
+            return None
+        value = int(raw)
+        return value if value > 0 else None
+
+    try:
+        total_max_tokens = _parse_limit("total_max_tokens")
+        total_duration_seconds = _parse_limit("total_duration_seconds")
+    except (TypeError, ValueError):
+        return _err("上限必须是整数")
+    if total_max_tokens is None and total_duration_seconds is None:
+        return _err("总输出 max_token 和总对话时长不能同时为无限，至少设置一个")
+
+    runner = RUNNERS.get(conv_id)
+    if runner is None:
+        record = get_conversation(conv_id)
+        if record is None:
+            return _err("对话不存在", 404)
+        if record.get("status") != "paused":
+            return _err("当前状态不能修改上限", 409)
+        runner = ConversationRunner.from_payload(record, _llm)
+        RUNNERS[conv_id] = runner
+
+    snapshot = runner.to_dict()
+    used_tokens = snapshot.get("total_output_tokens") or 0
+    elapsed = snapshot.get("elapsed_seconds") or 0
+    if total_max_tokens is not None and total_max_tokens <= used_tokens:
+        return _err(f"总输出 max_token 需大于已消耗的 {used_tokens}")
+    if total_duration_seconds is not None and total_duration_seconds <= elapsed:
+        return _err(f"总对话时长需大于已进行的 {int(elapsed)} 秒")
+
+    if not runner.update_limits(total_max_tokens, total_duration_seconds):
+        return _err("当前状态不能修改上限", 409)
+    return jsonify(runner.to_dict())
 
 
 @api_bp.post("/api/conversations/<conv_id>/summarize")

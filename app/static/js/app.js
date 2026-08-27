@@ -17,6 +17,7 @@
   let configId = null;
   let assistantSessionId = null;
   let chatConvId = null;
+  let chatConv = null;
   let chatSig = "";
 
   function defaultDraft() {
@@ -39,6 +40,9 @@
         gamma: 0.7,
         forbid_consecutive: true,
       },
+      end_vote_enabled: false,
+      end_vote_proposers: [],
+      end_vote_cooldown_turns: 3,
     };
   }
 
@@ -179,17 +183,37 @@
               <div class="sub">${escapeHtml(fmtTime(c.updated_at || c.created_at))} · ${c.turn || 0} 轮</div>
             </div>
             <span class="status-pill ${statusClass(c.status)}">${statusLabel(c.status)}</span>
+            <button class="btn-ghost list-delete" data-del="${escapeHtml(c.id)}" title="删除对话">🗑 删除</button>
           </div>
         `
         )
         .join("");
       list.querySelectorAll(".list-item").forEach((el) => {
-        el.addEventListener("click", () => {
+        el.addEventListener("click", (e) => {
+          if (e.target.closest("[data-del]")) return;
           location.hash = "#/chat/" + el.dataset.id;
+        });
+      });
+      list.querySelectorAll("[data-del]").forEach((btn) => {
+        btn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          deleteConversation(btn.dataset.del);
         });
       });
     } catch (e) {
       list.innerHTML = `<div class="empty">加载失败：${escapeHtml(e.message)}</div>`;
+    }
+  }
+
+  async function deleteConversation(id) {
+    if (!id) return;
+    if (!window.confirm("确定删除这个对话吗？此操作不可恢复。")) return;
+    try {
+      await api("/api/conversations/" + id, { method: "DELETE" });
+      toast("对话已删除");
+      await loadConversations();
+    } catch (e) {
+      toast("删除失败：" + e.message);
     }
   }
 
@@ -280,6 +304,9 @@
         { lam: 2.0, tau: 1.5, gamma: 0.7, forbid_consecutive: true },
         cfg.scheduler_params || {}
       ),
+      end_vote_enabled: !!cfg.end_vote_enabled,
+      end_vote_proposers: cfg.end_vote_proposers || [],
+      end_vote_cooldown_turns: cfg.end_vote_cooldown_turns == null ? 3 : cfg.end_vote_cooldown_turns,
     };
   }
 
@@ -321,6 +348,16 @@
               draft.first_speaker === a.name ? "selected" : ""
             }>${escapeHtml(a.name)}</option>`
         )
+      )
+      .join("");
+
+    const proposers = Array.isArray(draft.end_vote_proposers) ? draft.end_vote_proposers : [];
+    const proposerChips = draft.agents
+      .map(
+        (a) =>
+          `<label class="vis-chip"><input type="checkbox" data-proposer="${escapeHtml(a.id)}" ${
+            proposers.includes(a.id) || proposers.includes(a.name) ? "checked" : ""
+          } /> ${escapeHtml(a.name)}</label>`
       )
       .join("");
 
@@ -408,6 +445,24 @@
               draft.scheduler_params.forbid_consecutive ? "checked" : ""
             } style="width:auto;margin-top:8px" />
           </div>
+        </div>
+      </div>
+
+      <div class="field">
+        <label><input id="cfg-endvote" type="checkbox" ${
+          draft.end_vote_enabled ? "checked" : ""
+        } style="width:auto;margin-right:6px" /> 允许角色主动发起「结束对话投票」</label>
+        <div class="hint">被选定的角色可在发言中提议结束；全体一致同意才会结束（届时暂停，等你决定继续或总结）。不启用则到最大 token / 时长才停止。</div>
+      </div>
+      <div id="endvote-config" class="field ${draft.end_vote_enabled ? "" : "hidden"}">
+        <label>可发起结束投票的角色（一个或多个）</label>
+        <div class="vis-chips">${proposerChips}</div>
+        <div class="field" style="margin-top:10px">
+          <label>投票未通过后的冷却轮数</label>
+          <input id="cfg-endvote-cooldown" type="number" min="0" value="${
+            draft.end_vote_cooldown_turns == null ? 3 : draft.end_vote_cooldown_turns
+          }" />
+          <div class="hint">一次结束投票被否决后，多少轮内不再触发，避免反复打断。</div>
         </div>
       </div>
 
@@ -508,6 +563,33 @@
     if (gamma) gamma.addEventListener("input", () => (draft.scheduler_params.gamma = Number(gamma.value)));
     if (forbid)
       forbid.addEventListener("change", () => (draft.scheduler_params.forbid_consecutive = forbid.checked));
+
+    const endvote = $("cfg-endvote");
+    if (endvote)
+      endvote.addEventListener("change", () => {
+        draft.end_vote_enabled = endvote.checked;
+        renderConfigForm();
+      });
+    const endvoteCooldown = $("cfg-endvote-cooldown");
+    if (endvoteCooldown)
+      endvoteCooldown.addEventListener("input", () => {
+        const v = Number(endvoteCooldown.value);
+        draft.end_vote_cooldown_turns = Number.isFinite(v) && v >= 0 ? v : 0;
+      });
+    document.querySelectorAll("input[data-proposer]").forEach((chip) => {
+      chip.addEventListener("change", () => {
+        const pid = chip.dataset.proposer;
+        if (!Array.isArray(draft.end_vote_proposers)) draft.end_vote_proposers = [];
+        const agent = draft.agents.find((a) => a.id === pid);
+        if (chip.checked) {
+          if (!draft.end_vote_proposers.includes(pid)) draft.end_vote_proposers.push(pid);
+        } else {
+          draft.end_vote_proposers = draft.end_vote_proposers.filter(
+            (p) => p !== pid && !(agent && p === agent.name)
+          );
+        }
+      });
+    });
 
     $("add-agent").addEventListener("click", () => {
       const id = uid();
@@ -764,12 +846,13 @@
           <button class="back" data-back>‹</button>
           <div class="title" id="chat-title">加载中…</div>
           <div class="token-info" id="chat-tokens"></div>
-          <div id="chat-countdown" class="countdown"></div>
           <span id="chat-status" class="status-pill status-running">进行中</span>
+          <div id="chat-countdown" class="countdown"></div>
           <div id="chat-actions"></div>
         </div>
         <div id="chat-messages" class="chat-messages"></div>
         <div class="chat-footer">
+          <select id="chat-target" class="chat-target"></select>
           <input id="chat-input" type="text" placeholder="预约下一轮发言（会跳过调度，直接发言）" />
           <button id="chat-send" class="btn btn-primary">发送</button>
         </div>
@@ -785,6 +868,7 @@
       else if (id === "chat-resume") resumeChat();
       else if (id === "chat-summarize") summarizeChat();
       else if (id === "chat-vote") showVoteModal();
+      else if (id === "chat-extend") showExtendModal();
     });
     app.querySelector("#chat-send").addEventListener("click", sendHumanMessage);
     app.querySelector("#chat-input").addEventListener("keydown", (e) => {
@@ -825,6 +909,7 @@
     if (!chatConvId) return;
     try {
       const conv = await api("/api/conversations/" + chatConvId);
+      chatConv = conv;
       updateCountdown(conv);
       const sig = JSON.stringify({
         s: conv.status,
@@ -833,6 +918,7 @@
         summary: conv.summary || "",
         er: conv.ended_reason || "",
         pr: conv.paused_reason || "",
+        cr: !!conv.can_resume,
         v: conv.votes || [],
       });
       if (sig !== chatSig) {
@@ -866,33 +952,47 @@
     const isRunning = conv.status === "running";
     const isPaused = conv.status === "paused";
     const isLimitPause = isPaused && conv.paused_reason === "limit";
-    const canVote =
-      isPaused || (conv.status === "completed" && conv.ended_reason === "limit");
+    const canResume = !!conv.can_resume;
 
     if (isRunning) {
       actions.innerHTML = '<button id="chat-stop" class="btn btn-danger">暂停</button>';
     } else if (isPaused) {
       actions.innerHTML =
-        (isLimitPause ? "" : '<button id="chat-resume" class="btn btn-primary">继续</button>') +
-        '<button id="chat-vote" class="btn">投票</button>' +
-        '<button id="chat-summarize" class="btn">总结</button>';
-    } else if (canVote) {
-      actions.innerHTML = '<button id="chat-vote" class="btn btn-primary">发起投票</button>';
+        (canResume ? '<button id="chat-resume" class="btn btn-primary">继续对话</button>' : "") +
+        '<button id="chat-extend" class="btn">延长上限</button>' +
+        '<button id="chat-vote" class="btn">发起投票</button>' +
+        '<button id="chat-summarize" class="btn">总结并完成</button>';
     } else {
       actions.innerHTML = "";
     }
 
     const input = document.getElementById("chat-input");
     const sendBtn = document.getElementById("chat-send");
-    input.disabled = !isRunning;
+    const canSpeak = isRunning || isPaused;
+    input.disabled = !canSpeak;
     input.placeholder = isRunning
       ? "预约下一轮发言（会跳过调度，直接发言）"
       : isLimitPause
-        ? "已达上限，可发起投票或总结"
+        ? "已达上限：可延长上限、发言、投票或总结"
         : isPaused
-          ? "对话已暂停，可继续、投票或总结"
+          ? "对话已暂停：可发言、继续、投票或总结"
           : "对话已结束";
-    if (sendBtn) sendBtn.disabled = !isRunning;
+    if (sendBtn) sendBtn.disabled = !canSpeak;
+
+    const targetSel = document.getElementById("chat-target");
+    if (targetSel) {
+      const prev = targetSel.value;
+      const opts = ['<option value="">指定回答：不指定</option>'].concat(
+        (conv.agents || []).map(
+          (a) => `<option value="${escapeHtml(a.id)}">指定「${escapeHtml(a.name)}」回答</option>`
+        )
+      );
+      targetSel.innerHTML = opts.join("");
+      if (prev && targetSel.querySelector(`option[value="${CSS.escape(prev)}"]`)) {
+        targetSel.value = prev;
+      }
+      targetSel.disabled = !canSpeak;
+    }
 
     const box = document.getElementById("chat-messages");
     const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 120;
@@ -933,6 +1033,9 @@
         const parts = m.scores.map((s) => `${escapeHtml(s.name)} ${s.score}`).join(" · ");
         scoreLine = `<div class="score-line">意愿分：${parts}</div>`;
       }
+      const endTag = m.proposed_end
+        ? '<div class="score-line">🔚 该角色提议结束对话，已发起全体投票</div>'
+        : "";
       return `
         <div class="msg agent">
           <div class="avatar" style="background:${escapeHtml(a.color)}">${escapeHtml(a.initial)}</div>
@@ -941,6 +1044,7 @@
             <div class="msg-time">${escapeHtml(fmtTime(m.ts))}</div>
             <div class="bubble">${escapeHtml(m.content)}</div>
             ${scoreLine}
+            ${endTag}
           </div>
         </div>
       `;
@@ -988,11 +1092,13 @@
     const input = document.getElementById("chat-input");
     const content = input.value.trim();
     if (!content) return;
+    const targetSel = document.getElementById("chat-target");
+    const target = targetSel ? targetSel.value : "";
     input.value = "";
     try {
       await api("/api/conversations/" + chatConvId + "/reserve", {
         method: "POST",
-        body: JSON.stringify({ content }),
+        body: JSON.stringify({ content, target }),
       });
     } catch (e) {
       toast("发送失败：" + e.message);
@@ -1034,6 +1140,75 @@
       pollChat();
     } catch (e) {
       toast("总结失败：" + e.message);
+    }
+  }
+
+  function closeExtendModal() {
+    const el = document.getElementById("extend-modal");
+    if (el) el.remove();
+  }
+
+  function showExtendModal() {
+    const conv = chatConv || {};
+    closeExtendModal();
+    const overlay = document.createElement("div");
+    overlay.id = "extend-modal";
+    overlay.className = "modal-overlay";
+    overlay.innerHTML = `
+      <div class="modal">
+        <div class="modal-head">
+          <strong>延长上限</strong>
+          <button type="button" class="btn-ghost" data-close>×</button>
+        </div>
+        <div class="modal-body">
+          <div class="field">
+            <label>总输出 max_token（已消耗 ${conv.total_output_tokens || 0}）</label>
+            <input id="extend-tokens" type="number" value="${
+              conv.total_max_tokens == null ? "" : conv.total_max_tokens
+            }" placeholder="留空表示不限" />
+          </div>
+          <div class="field">
+            <label>总对话时长（秒，已进行 ${Math.floor(conv.elapsed_seconds || 0)}）</label>
+            <input id="extend-duration" type="number" value="${
+              conv.total_duration_seconds == null ? "" : conv.total_duration_seconds
+            }" placeholder="留空表示不限" />
+          </div>
+          <div class="hint">两者不能同时留空。改大后即可点「继续对话」。</div>
+        </div>
+        <div class="modal-foot">
+          <button type="button" class="btn" data-cancel>取消</button>
+          <button type="button" id="extend-submit" class="btn btn-primary">保存</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) closeExtendModal();
+    });
+    overlay.querySelector("[data-close]").addEventListener("click", closeExtendModal);
+    overlay.querySelector("[data-cancel]").addEventListener("click", closeExtendModal);
+    overlay.querySelector("#extend-submit").addEventListener("click", submitExtend);
+  }
+
+  async function submitExtend() {
+    const modal = document.getElementById("extend-modal");
+    if (!modal) return;
+    const t = modal.querySelector("#extend-tokens").value;
+    const d = modal.querySelector("#extend-duration").value;
+    try {
+      await api("/api/conversations/" + chatConvId + "/limits", {
+        method: "POST",
+        body: JSON.stringify({
+          total_max_tokens: t ? Number(t) : null,
+          total_duration_seconds: d ? Number(d) : null,
+        }),
+      });
+      toast("上限已更新，可点「继续对话」");
+      closeExtendModal();
+      chatSig = "";
+      pollChat();
+    } catch (e) {
+      toast("更新失败：" + e.message);
     }
   }
 
@@ -1197,7 +1372,15 @@
       .join("");
     return `
       <div class="vote-block">
-        <div class="vote-head">🗳️ 投票 · ${statusText}</div>
+        <div class="vote-head">${
+          vote.kind === "end" ? "🔚 结束投票" : "🗳️ 投票"
+        } · ${statusText}${
+          vote.kind === "end" && vote.status === "completed"
+            ? vote.agreed
+              ? " · 已通过，全体同意结束"
+              : " · 未通过，继续对话"
+            : ""
+        }</div>
         <div class="vote-question">${escapeHtml(vote.question)}</div>
         <div class="vote-options">${resultsHtml}</div>
         ${ballots ? `<div class="vote-ballots">${ballots}</div>` : ""}

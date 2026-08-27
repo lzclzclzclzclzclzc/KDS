@@ -10,6 +10,8 @@ from app.db import update_conversation
 from app.llm import LLMClient
 from app.scheduler import update_heat, willingness_select
 
+END_PROPOSAL_MARKER = "【提议结束对话】"
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -68,6 +70,10 @@ class ConversationRunner:
         self.gamma = float(sp.get("gamma", 0.7))
         self.forbid_consecutive = bool(sp.get("forbid_consecutive", True))
 
+        self.end_vote_enabled = bool(config.get("end_vote_enabled"))
+        self.end_vote_proposers = list(config.get("end_vote_proposers") or [])
+        self.end_vote_cooldown_turns = int(config.get("end_vote_cooldown_turns") or 3)
+
         self.messages: list[dict] = []
         self.heat = [0.0] * len(self.agents)
         self.turn = 0
@@ -82,8 +88,11 @@ class ConversationRunner:
         self.paused_reason = None
         self.ended_reason = None
         self.votes: list[dict] = []
+        self._end_vote_block_until_turn = -1
 
         self.pending_human_message: Optional[str] = None
+        self.pending_human_target: Optional[int] = None
+        self._forced_next_idx: Optional[int] = None
         self._interrupt_requested = False
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
@@ -150,7 +159,7 @@ class ConversationRunner:
     def resume(self) -> bool:
         old_thread = None
         with self._lock:
-            if self.status != "paused" or self.paused_reason == "limit":
+            if self.status != "paused" or self._limit_reached_nolock():
                 return False
             old_thread = self._thread
         if old_thread is not None and old_thread.is_alive():
@@ -187,6 +196,49 @@ class ConversationRunner:
         with self._lock:
             self.pending_human_message = content
 
+    def _resolve_agent_idx(self, target: Optional[str]) -> Optional[int]:
+        if not target:
+            return None
+        for i, a in enumerate(self.agents):
+            if a["id"] == target or a["name"] == target:
+                return i
+        return None
+
+    def human_say(self, content: str, target: Optional[str] = None) -> Optional[str]:
+        """Human message: queue it while running, append immediately while paused.
+
+        If target names an agent (by id or name), that agent is forced to speak
+        on the next agent turn, bypassing the scheduler.
+        """
+        target_idx = self._resolve_agent_idx(target)
+        with self._lock:
+            status = self.status
+        if status == "running":
+            with self._lock:
+                self.pending_human_message = content
+                self.pending_human_target = target_idx
+            return "reserved"
+        if status == "paused":
+            self._append_message("human", "人类", content, 0)
+            with self._lock:
+                self.turn += 1
+                if target_idx is not None:
+                    self._forced_next_idx = target_idx
+            self._persist()
+            return "appended"
+        return None
+
+    def update_limits(
+        self, total_max_tokens: Optional[int], total_duration_seconds: Optional[int]
+    ) -> bool:
+        with self._lock:
+            if self.status != "paused":
+                return False
+            self.total_max_tokens = total_max_tokens
+            self.total_duration_seconds = total_duration_seconds
+        self._persist()
+        return True
+
     def interrupt(self) -> None:
         with self._lock:
             self._interrupt_requested = True
@@ -199,6 +251,7 @@ class ConversationRunner:
             remaining_seconds = None
             if self.total_duration_seconds is not None:
                 remaining_seconds = max(0.0, self.total_duration_seconds - active_seconds)
+            can_resume = self.status == "paused" and not self._limit_reached_nolock()
             return {
                 "id": self.id,
                 "config_id": self.config_id,
@@ -218,6 +271,7 @@ class ConversationRunner:
                 "error": self.error,
                 "paused_reason": self.paused_reason,
                 "ended_reason": self.ended_reason,
+                "can_resume": can_resume,
                 "votes": [dict(v) for v in self.votes],
                 "config": {
                     "agents": [dict(a) for a in self.agents],
@@ -234,10 +288,15 @@ class ConversationRunner:
                         "gamma": self.gamma,
                         "forbid_consecutive": self.forbid_consecutive,
                     },
+                    "end_vote_enabled": self.end_vote_enabled,
+                    "end_vote_proposers": list(self.end_vote_proposers),
+                    "end_vote_cooldown_turns": self.end_vote_cooldown_turns,
                 },
                 "heat": list(self.heat),
                 "order": list(self.order),
                 "rr_index": self._rr_index,
+                "end_vote_block_until_turn": self._end_vote_block_until_turn,
+                "forced_next_idx": self._forced_next_idx,
                 "last_agent_idx": self.last_agent_idx,
                 "active_seconds": self._active_seconds,
                 "elapsed_seconds": round(active_seconds, 1),
@@ -275,6 +334,9 @@ class ConversationRunner:
         if order and len(order) == len(runner.agents):
             runner.order = [int(x) for x in order]
         runner._rr_index = int(conv.get("rr_index", 0) or 0) % max(1, len(runner.order))
+        runner._end_vote_block_until_turn = int(conv.get("end_vote_block_until_turn", -1) or -1)
+        fni = conv.get("forced_next_idx")
+        runner._forced_next_idx = int(fni) if isinstance(fni, int) else None
         runner._active_seconds = float(conv.get("active_seconds", 0.0) or 0.0)
         runner._segment_start = None
         return runner
@@ -305,11 +367,30 @@ class ConversationRunner:
 
         return "\n".join(parts)
 
+    def _is_proposer(self, agent: dict) -> bool:
+        if not self.end_vote_enabled:
+            return False
+        return agent["id"] in self.end_vote_proposers or agent["name"] in self.end_vote_proposers
+
     def _build_system(self, agent: dict) -> str:
-        return self._build_persona(agent) + (
+        base = self._build_persona(agent) + (
             "\n\n你正在参与一场多人实时群聊。请以你角色的口吻，用中文自然发言，"
             "直接输出发言内容，不要添加「某某说：」之类的前缀。"
         )
+        if self._is_proposer(agent):
+            base += (
+                "\n\n如果你认为这场对话可以自然结束了，可以在你发言的最后另起一行，单独输出标记 "
+                f"{END_PROPOSAL_MARKER} 。这会发起一次全体投票，只有所有参与者都同意才会结束对话；"
+                "只要有一人反对就继续。若你不希望结束，就不要输出这个标记。"
+            )
+        return base
+
+    @staticmethod
+    def _extract_end_proposal(content: str) -> tuple[bool, str]:
+        if content and END_PROPOSAL_MARKER in content:
+            cleaned = content.replace(END_PROPOSAL_MARKER, "").strip()
+            return True, cleaned
+        return False, content
 
     def _build_score_system(self, agent: dict) -> str:
         return self._build_persona(agent) + (
@@ -350,11 +431,14 @@ class ConversationRunner:
 
     # ---- Time / limits ----
 
+    def _elapsed_nolock(self) -> float:
+        if self._segment_start is None:
+            return self._active_seconds
+        return self._active_seconds + (time.time() - self._segment_start)
+
     def _elapsed(self) -> float:
         with self._lock:
-            if self._segment_start is None:
-                return self._active_seconds
-            return self._active_seconds + (time.time() - self._segment_start)
+            return self._elapsed_nolock()
 
     def _pause_segment(self) -> None:
         with self._lock:
@@ -362,12 +446,16 @@ class ConversationRunner:
                 self._active_seconds += time.time() - self._segment_start
                 self._segment_start = None
 
-    def _limit_reached(self) -> bool:
+    def _limit_reached_nolock(self) -> bool:
         if self.total_max_tokens is not None and self.total_output_tokens >= self.total_max_tokens:
             return True
-        if self.total_duration_seconds is not None and self._elapsed() >= self.total_duration_seconds:
+        if self.total_duration_seconds is not None and self._elapsed_nolock() >= self.total_duration_seconds:
             return True
         return False
+
+    def _limit_reached(self) -> bool:
+        with self._lock:
+            return self._limit_reached_nolock()
 
     # ---- Main loop ----
 
@@ -375,6 +463,7 @@ class ConversationRunner:
         with self._lock:
             if self._segment_start is None:
                 self._segment_start = time.time()
+        end_voted = False
         try:
             while True:
                 with self._lock:
@@ -384,26 +473,37 @@ class ConversationRunner:
                     break
 
                 human_msg = None
+                human_target = None
                 with self._lock:
                     if self.pending_human_message is not None:
                         human_msg = self.pending_human_message
                         self.pending_human_message = None
+                        human_target = self.pending_human_target
+                        self.pending_human_target = None
 
                 if human_msg is not None:
                     self._append_message("human", "人类", human_msg, 0)
-                    self.turn += 1
+                    with self._lock:
+                        self.turn += 1
+                        if human_target is not None:
+                            self._forced_next_idx = human_target
                     self._persist()
                     continue
 
+                if not self.agents:
+                    break
                 scores = None
-                if self.scheduling_mode == "round_robin":
-                    if not self.agents:
-                        break
+                forced_idx = None
+                with self._lock:
+                    if self._forced_next_idx is not None and 0 <= self._forced_next_idx < len(self.agents):
+                        forced_idx = self._forced_next_idx
+                    self._forced_next_idx = None
+                if forced_idx is not None:
+                    idx = forced_idx
+                elif self.scheduling_mode == "round_robin":
                     idx = self.order[self._rr_index % len(self.order)]
                     self._rr_index += 1
                 else:
-                    if not self.agents:
-                        break
                     if self.turn == 0:
                         idx = self.first_idx
                     else:
@@ -416,30 +516,41 @@ class ConversationRunner:
                 system += f"\n\n（单次发言请控制在约 {max_tokens} tokens 以内，超出部分会被系统截断。）"
                 content, usage = self.llm.speak(agent["name"], system, self._history(), max_tokens)
 
-                self._append_message("agent", agent["name"], content, usage["completion_tokens"], scores=scores)
+                proposed_end = False
+                if self._is_proposer(agent):
+                    proposed_end, content = self._extract_end_proposal(content)
+
+                self._append_message(
+                    "agent", agent["name"], content, usage["completion_tokens"],
+                    scores=scores, proposed_end=proposed_end,
+                )
                 self.total_output_tokens += usage["completion_tokens"]
                 self.total_prompt_tokens += usage["prompt_tokens"]
                 self.heat = update_heat(self.heat, idx, self.gamma)
                 self.last_agent_idx = idx
-                self.turn += 1
+                with self._lock:
+                    self.turn += 1
                 self._persist()
+
+                if proposed_end and self.turn > self._end_vote_block_until_turn:
+                    if self._run_end_vote_inline():
+                        end_voted = True
+                        break
+                    self._end_vote_block_until_turn = self.turn + self.end_vote_cooldown_turns
 
             with self._lock:
                 was_interrupted = self._interrupt_requested
-            if was_interrupted:
-                self._pause_segment()
-                with self._lock:
-                    self.status = "paused"
+            self._pause_segment()
+            with self._lock:
+                self.status = "paused"
+                if end_voted:
+                    self.paused_reason = "vote_end"
+                elif was_interrupted:
                     self.paused_reason = "manual"
-                    self._interrupt_requested = False
-                self._persist()
-            else:
-                self._pause_segment()
-                with self._lock:
-                    self.status = "paused"
+                else:
                     self.paused_reason = "limit"
-                    self._interrupt_requested = False
-                self._persist()
+                self._interrupt_requested = False
+            self._persist()
         except Exception as exc:  # pragma: no cover - defensive
             # Pause recoverably instead of terminally erroring, so a transient
             # LLM failure doesn't kill the whole conversation. resume() only
@@ -470,6 +581,85 @@ class ConversationRunner:
         else:
             self.summary = "本次对话没有任何发言。"
         self._persist()
+
+    def _run_end_vote_inline(self) -> bool:
+        """Run a unanimous end-conversation vote inline in the main loop.
+
+        Returns True only if every agent voted to end. Recorded in self.votes
+        with kind="end" so the transcript renders it like other votes.
+        """
+        if not self.agents:
+            return False
+        options = ["同意结束", "继续讨论"]
+        question = "有角色提议结束本次对话，是否结束？"
+        vote_id = f"v{len(self.votes) + 1}"
+        with self._lock:
+            self.votes.append(
+                {
+                    "id": vote_id,
+                    "kind": "end",
+                    "question": question,
+                    "options": options,
+                    "votes_per_person": 1,
+                    "status": "running",
+                    "created_at": _now(),
+                    "results": {"1": 0, "2": 0},
+                    "ballots": [],
+                    "agreed": False,
+                    "error": None,
+                }
+            )
+        self._persist()
+
+        results = {"1": 0, "2": 0}
+        ballots = []
+        try:
+            for agent in self.agents:
+                system = self._build_vote_system(agent, question, options, 1)
+                result, usage = self.llm.vote(
+                    agent["name"], system, self._log_text(), question, options, 1
+                )
+                self.total_output_tokens += usage["completion_tokens"]
+                self.total_prompt_tokens += usage["prompt_tokens"]
+                choices = result.get("choices") or []
+                reason = result.get("reason", "") or ""
+                for choice in choices:
+                    key = str(choice)
+                    if key in results:
+                        results[key] += 1
+                ballots.append(
+                    {
+                        "agent_id": agent["id"],
+                        "agent_name": agent["name"],
+                        "choices": [str(c) for c in choices],
+                        "reason": reason,
+                    }
+                )
+                with self._lock:
+                    v = next((x for x in self.votes if x["id"] == vote_id), None)
+                    if v is not None:
+                        v["ballots"] = [dict(b) for b in ballots]
+                        v["results"] = dict(results)
+                self._persist()
+
+            agreed = len(self.agents) > 0 and results["1"] >= len(self.agents)
+            with self._lock:
+                v = next((x for x in self.votes if x["id"] == vote_id), None)
+                if v is not None:
+                    v["status"] = "completed"
+                    v["ballots"] = [dict(b) for b in ballots]
+                    v["results"] = dict(results)
+                    v["agreed"] = agreed
+            self._persist()
+            return agreed
+        except Exception as exc:
+            with self._lock:
+                v = next((x for x in self.votes if x["id"] == vote_id), None)
+                if v is not None:
+                    v["status"] = "error"
+                    v["error"] = f"{exc}\n{traceback.format_exc()}"
+            self._persist()
+            return False
 
     def _build_vote_system(self, agent: dict, question: str, options: list[str], votes_per_person: int) -> str:
         options_text = "\n".join(f"{i + 1}. {o}" for i, o in enumerate(options))
@@ -577,7 +767,7 @@ class ConversationRunner:
                     vote["error"] = f"{exc}\n{traceback.format_exc()}"
             self._persist()
 
-    def _append_message(self, role: str, speaker: str, content: str, tokens: int, scores: Optional[list[dict]] = None) -> None:
+    def _append_message(self, role: str, speaker: str, content: str, tokens: int, scores: Optional[list[dict]] = None, proposed_end: bool = False) -> None:
         with self._lock:
             message = {
                 "role": role,
@@ -589,6 +779,8 @@ class ConversationRunner:
             }
             if scores is not None:
                 message["scores"] = scores
+            if proposed_end:
+                message["proposed_end"] = True
             self.messages.append(message)
 
     def _persist(self) -> None:
