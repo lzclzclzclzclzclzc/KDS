@@ -64,6 +64,17 @@ def _clean_config(payload: dict) -> tuple[str, dict]:
     if end_vote_cooldown_turns < 0:
         end_vote_cooldown_turns = 0
 
+    whiteboard_enabled = bool(payload.get("whiteboard_enabled"))
+    whiteboard_format = payload.get("whiteboard_format") or "md"
+    if whiteboard_format not in ("md", "html"):
+        raise ValueError("白板格式只能是 md 或 html")
+    raw_wb_editors = payload.get("whiteboard_editors") or []
+    if not isinstance(raw_wb_editors, list):
+        raise ValueError("白板可编辑角色必须是数组")
+    whiteboard_editors = [str(p) for p in raw_wb_editors if str(p) in valid_ids]
+    if whiteboard_enabled and not whiteboard_editors:
+        raise ValueError("启用白板时，至少需要选定一个可编辑的角色")
+
     config = {
         "shared_background": payload.get("shared_background") or "",
         "agents": cleaned_agents,
@@ -77,6 +88,9 @@ def _clean_config(payload: dict) -> tuple[str, dict]:
         "end_vote_enabled": end_vote_enabled,
         "end_vote_proposers": end_vote_proposers,
         "end_vote_cooldown_turns": end_vote_cooldown_turns,
+        "whiteboard_enabled": whiteboard_enabled,
+        "whiteboard_format": whiteboard_format,
+        "whiteboard_editors": whiteboard_editors,
     }
     if config["total_max_tokens"] is None and config["total_duration_seconds"] is None:
         raise ValueError("总输出 max_token 和总对话时长不能同时为无限，至少设置一个")
@@ -184,6 +198,9 @@ def conversations_create():
         "end_vote_enabled": config.get("end_vote_enabled", False),
         "end_vote_proposers": config.get("end_vote_proposers", []),
         "end_vote_cooldown_turns": config.get("end_vote_cooldown_turns", 3),
+        "whiteboard_enabled": config.get("whiteboard_enabled", False),
+        "whiteboard_format": config.get("whiteboard_format", "md"),
+        "whiteboard_editors": config.get("whiteboard_editors", []),
     }
     runner = ConversationRunner(conv_id, config_id, name, config_payload, _llm)
     initial = runner.to_dict()

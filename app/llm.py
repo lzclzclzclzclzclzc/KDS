@@ -121,6 +121,52 @@ def _parse_vote(text: str, options: list[str], votes_per_person: int) -> tuple[l
     return choices[:votes_per_person], reason
 
 
+def _normalize_whiteboard_ops(wb) -> list[dict]:
+    """Coerce a model-supplied whiteboard field into a list of op dicts."""
+    if wb is None:
+        return []
+    raw = []
+    if isinstance(wb, dict):
+        if isinstance(wb.get("ops"), list):
+            raw = wb["ops"]
+        elif any(k in wb for k in ("op", "content", "find", "append", "replace")):
+            raw = [wb]
+    elif isinstance(wb, list):
+        raw = wb
+    elif isinstance(wb, str) and wb.strip():
+        raw = [{"op": "set", "content": wb}]
+    ops = []
+    for o in raw:
+        if isinstance(o, dict):
+            ops.append(o)
+        elif isinstance(o, str) and o.strip():
+            ops.append({"op": "append", "content": o})
+    return ops
+
+
+def _parse_turn(text: str) -> dict:
+    """Parse a structured agent turn into {speech, propose_end, whiteboard_ops}.
+
+    Defensive: if the output is not valid JSON, treat the whole thing as speech.
+    """
+    data = _extract_json(text)
+    if not isinstance(data, dict):
+        return {"speech": (text or "").strip(), "propose_end": False, "whiteboard_ops": []}
+    speech = data.get("speech")
+    if not isinstance(speech, str) or not speech.strip():
+        for alt_key in ("content", "message", "text", "reply"):
+            alt = data.get(alt_key)
+            if isinstance(alt, str) and alt.strip():
+                speech = alt
+                break
+    speech = (speech if isinstance(speech, str) else "") or ""
+    return {
+        "speech": speech.strip(),
+        "propose_end": bool(data.get("propose_end")),
+        "whiteboard_ops": _normalize_whiteboard_ops(data.get("whiteboard")),
+    }
+
+
 class LLMClient:
     """Thin OpenAI-compatible client with an offline mock mode."""
 
@@ -214,6 +260,25 @@ class LLMClient:
         )
         content, usage = self._call(messages, self.temperature, max_tokens=max_tokens)
         return content, usage
+
+    def agent_turn(self, name: str, system: str, history: list[dict], max_tokens: int) -> tuple[dict, dict]:
+        """One speaking turn, returned as a structured dict.
+
+        Returns ({"speech", "propose_end", "whiteboard_ops"}, usage). The engine's
+        system prompt declares which JSON fields the agent may use (based on its
+        capabilities); parsing is defensive and falls back to plain speech.
+        """
+        if self.mock:
+            speech = self._mock_speak(name, history)
+            usage = {"prompt_tokens": 0, "completion_tokens": len(speech), "total_tokens": len(speech)}
+            return {"speech": speech, "propose_end": False, "whiteboard_ops": []}, usage
+        messages = [{"role": "system", "content": system}]
+        messages.extend(history)
+        messages.append(
+            {"role": "user", "content": f"轮到 {name} 发言。请严格按 system 中的要求，只输出一个 JSON 对象。"}
+        )
+        content, usage = self._call(messages, self.temperature, max_tokens=max_tokens, json_mode=True)
+        return _parse_turn(content), usage
 
     def summarize(self, log_text: str) -> tuple[str, dict]:
         if self.mock:

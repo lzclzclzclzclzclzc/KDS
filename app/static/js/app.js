@@ -19,6 +19,8 @@
   let chatConvId = null;
   let chatConv = null;
   let chatSig = "";
+  let wbOpen = false;
+  let wbView = "render";
 
   function defaultDraft() {
     return {
@@ -43,6 +45,9 @@
       end_vote_enabled: false,
       end_vote_proposers: [],
       end_vote_cooldown_turns: 3,
+      whiteboard_enabled: false,
+      whiteboard_format: "md",
+      whiteboard_editors: [],
     };
   }
 
@@ -307,6 +312,9 @@
       end_vote_enabled: !!cfg.end_vote_enabled,
       end_vote_proposers: cfg.end_vote_proposers || [],
       end_vote_cooldown_turns: cfg.end_vote_cooldown_turns == null ? 3 : cfg.end_vote_cooldown_turns,
+      whiteboard_enabled: !!cfg.whiteboard_enabled,
+      whiteboard_format: cfg.whiteboard_format || "md",
+      whiteboard_editors: cfg.whiteboard_editors || [],
     };
   }
 
@@ -357,6 +365,16 @@
         (a) =>
           `<label class="vis-chip"><input type="checkbox" data-proposer="${escapeHtml(a.id)}" ${
             proposers.includes(a.id) || proposers.includes(a.name) ? "checked" : ""
+          } /> ${escapeHtml(a.name)}</label>`
+      )
+      .join("");
+
+    const wbEditors = Array.isArray(draft.whiteboard_editors) ? draft.whiteboard_editors : [];
+    const wbEditorChips = draft.agents
+      .map(
+        (a) =>
+          `<label class="vis-chip"><input type="checkbox" data-wbeditor="${escapeHtml(a.id)}" ${
+            wbEditors.includes(a.id) || wbEditors.includes(a.name) ? "checked" : ""
           } /> ${escapeHtml(a.name)}</label>`
       )
       .join("");
@@ -463,6 +481,26 @@
             draft.end_vote_cooldown_turns == null ? 3 : draft.end_vote_cooldown_turns
           }" />
           <div class="hint">一次结束投票被否决后，多少轮内不再触发，避免反复打断。</div>
+        </div>
+      </div>
+
+      <div class="field">
+        <label><input id="cfg-whiteboard" type="checkbox" ${
+          draft.whiteboard_enabled ? "checked" : ""
+        } style="width:auto;margin-right:6px" /> 启用白板（最终产出物）</label>
+        <div class="hint">启用后，人类可在对话界面右侧调出白板查看（只读，不中断对话）；有权限的角色会在自己回合增量编辑它。</div>
+      </div>
+      <div id="whiteboard-config" class="field ${draft.whiteboard_enabled ? "" : "hidden"}">
+        <div class="field">
+          <label>白板格式</label>
+          <select id="cfg-wb-format">
+            <option value="md" ${draft.whiteboard_format === "md" ? "selected" : ""}>Markdown</option>
+            <option value="html" ${draft.whiteboard_format === "html" ? "selected" : ""}>HTML</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>可编辑白板的角色（一个或多个）</label>
+          <div class="vis-chips">${wbEditorChips}</div>
         </div>
       </div>
 
@@ -586,6 +624,32 @@
         } else {
           draft.end_vote_proposers = draft.end_vote_proposers.filter(
             (p) => p !== pid && !(agent && p === agent.name)
+          );
+        }
+      });
+    });
+
+    const wbEnable = $("cfg-whiteboard");
+    if (wbEnable)
+      wbEnable.addEventListener("change", () => {
+        draft.whiteboard_enabled = wbEnable.checked;
+        renderConfigForm();
+      });
+    const wbFormat = $("cfg-wb-format");
+    if (wbFormat)
+      wbFormat.addEventListener("change", () => {
+        draft.whiteboard_format = wbFormat.value;
+      });
+    document.querySelectorAll("input[data-wbeditor]").forEach((chip) => {
+      chip.addEventListener("change", () => {
+        const eid = chip.dataset.wbeditor;
+        if (!Array.isArray(draft.whiteboard_editors)) draft.whiteboard_editors = [];
+        const agent = draft.agents.find((a) => a.id === eid);
+        if (chip.checked) {
+          if (!draft.whiteboard_editors.includes(eid)) draft.whiteboard_editors.push(eid);
+        } else {
+          draft.whiteboard_editors = draft.whiteboard_editors.filter(
+            (p) => p !== eid && !(agent && p === agent.name)
           );
         }
       });
@@ -840,6 +904,8 @@
     }
     chatConvId = id;
     chatSig = "";
+    wbOpen = false;
+    wbView = "render";
     app.innerHTML = `
       <div class="chat-shell">
         <div class="chat-header">
@@ -849,6 +915,7 @@
           <span id="chat-status" class="status-pill status-running">进行中</span>
           <div id="chat-countdown" class="countdown"></div>
           <div id="chat-actions"></div>
+          <button id="chat-whiteboard-toggle" class="btn btn-ghost hidden">📋 白板</button>
         </div>
         <div id="chat-messages" class="chat-messages"></div>
         <div class="chat-footer">
@@ -856,11 +923,38 @@
           <input id="chat-input" type="text" placeholder="预约下一轮发言（会跳过调度，直接发言）" />
           <button id="chat-send" class="btn btn-primary">发送</button>
         </div>
+        <div id="whiteboard-layer" class="whiteboard-layer">
+          <div class="whiteboard-head">
+            <strong>📋 白板</strong>
+            <span id="wb-meta" class="wb-meta"></span>
+            <span class="grow"></span>
+            <div class="wb-tabs">
+              <button class="wb-tab active" data-wb-view="render">渲染</button>
+              <button class="wb-tab" data-wb-view="raw">源码</button>
+            </div>
+            <button id="wb-close" class="btn-ghost" title="收起白板">×</button>
+          </div>
+          <div id="whiteboard-body" class="whiteboard-body"></div>
+        </div>
       </div>
     `;
 
     app.querySelector("[data-back]").addEventListener("click", () => {
       location.hash = "#/";
+    });
+    app.querySelector("#chat-whiteboard-toggle").addEventListener("click", () => {
+      wbOpen = !wbOpen;
+      renderWhiteboard(chatConv);
+    });
+    app.querySelector("#wb-close").addEventListener("click", () => {
+      wbOpen = false;
+      renderWhiteboard(chatConv);
+    });
+    app.querySelector("#whiteboard-layer .wb-tabs").addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-wb-view]");
+      if (!btn) return;
+      wbView = btn.dataset.wbView;
+      renderWhiteboard(chatConv);
     });
     app.querySelector("#chat-actions").addEventListener("click", (e) => {
       const id = e.target.id;
@@ -877,6 +971,7 @@
 
     pollChat();
     window.chatTimer = setInterval(pollChat, 1000);
+    window.countdownTimer = setInterval(renderCountdown, 1000);
   }
 
   function clearChatTimer() {
@@ -884,25 +979,44 @@
       clearInterval(window.chatTimer);
       window.chatTimer = null;
     }
+    if (window.countdownTimer) {
+      clearInterval(window.countdownTimer);
+      window.countdownTimer = null;
+    }
   }
 
+  // Anchor the countdown to the last server value + a local timestamp, then let a
+  // 1s client ticker interpolate — so it steps exactly once per second regardless
+  // of polling/network jitter, and re-syncs to the server on every poll.
+  let countdownAnchor = null;
+
   function updateCountdown(conv) {
-    const el = document.getElementById("chat-countdown");
-    if (!el) return;
     if (
       conv.status === "running" &&
       conv.total_duration_seconds != null &&
       conv.remaining_seconds != null
     ) {
-      const seconds = Math.max(0, Math.floor(conv.remaining_seconds));
-      const mm = String(Math.floor(seconds / 60)).padStart(2, "0");
-      const ss = String(seconds % 60).padStart(2, "0");
-      el.textContent = `倒计时 ${mm}:${ss}`;
-      el.classList.toggle("countdown-warning", seconds <= 60);
+      countdownAnchor = { remaining: conv.remaining_seconds, at: Date.now() };
     } else {
+      countdownAnchor = null;
+    }
+    renderCountdown();
+  }
+
+  function renderCountdown() {
+    const el = document.getElementById("chat-countdown");
+    if (!el) return;
+    if (!countdownAnchor) {
       el.textContent = "";
       el.classList.remove("countdown-warning");
+      return;
     }
+    const elapsed = (Date.now() - countdownAnchor.at) / 1000;
+    const seconds = Math.max(0, Math.floor(countdownAnchor.remaining - elapsed));
+    const mm = String(Math.floor(seconds / 60)).padStart(2, "0");
+    const ss = String(seconds % 60).padStart(2, "0");
+    el.textContent = `倒计时 ${mm}:${ss}`;
+    el.classList.toggle("countdown-warning", seconds <= 60);
   }
 
   async function pollChat() {
@@ -920,6 +1034,7 @@
         pr: conv.paused_reason || "",
         cr: !!conv.can_resume,
         v: conv.votes || [],
+        wb: conv.whiteboard ? (conv.whiteboard.enabled ? 1 : 0) + ":" + (conv.whiteboard.rev || 0) : "",
       });
       if (sig !== chatSig) {
         chatSig = sig;
@@ -998,6 +1113,134 @@
     const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 120;
     box.innerHTML = renderMessagesHTML(conv);
     if (nearBottom) box.scrollTop = box.scrollHeight;
+
+    renderWhiteboard(conv);
+  }
+
+  function renderWhiteboard(conv) {
+    const toggle = document.getElementById("chat-whiteboard-toggle");
+    const layer = document.getElementById("whiteboard-layer");
+    if (!toggle || !layer) return;
+    const wb = conv && conv.whiteboard;
+    if (!wb || !wb.enabled) {
+      toggle.classList.add("hidden");
+      layer.classList.remove("open");
+      return;
+    }
+    toggle.classList.remove("hidden");
+    toggle.classList.toggle("active", wbOpen);
+    layer.classList.toggle("open", wbOpen);
+    if (!wbOpen) return;
+
+    const meta = document.getElementById("wb-meta");
+    if (meta) {
+      const fmt = wb.format === "html" ? "HTML" : "Markdown";
+      const parts = [fmt];
+      if (wb.last_editor) parts.push("最近编辑：" + wb.last_editor);
+      if (wb.rev) parts.push("v" + wb.rev);
+      meta.textContent = parts.join(" · ");
+    }
+    layer
+      .querySelectorAll(".wb-tab")
+      .forEach((t) => t.classList.toggle("active", t.dataset.wbView === wbView));
+
+    const body = document.getElementById("whiteboard-body");
+    const content = (wb.content || "").toString();
+    if (!content.trim()) {
+      body.innerHTML = '<div class="empty">白板还是空的，等有编辑权限的角色来填充。</div>';
+      return;
+    }
+    if (wbView === "raw") {
+      body.innerHTML = `<pre class="wb-raw">${escapeHtml(content)}</pre>`;
+    } else if (wb.format === "html") {
+      const iframe = document.createElement("iframe");
+      iframe.className = "wb-frame";
+      iframe.setAttribute("sandbox", "");
+      iframe.srcdoc = content;
+      body.innerHTML = "";
+      body.appendChild(iframe);
+    } else {
+      body.innerHTML = `<div class="wb-md">${renderMarkdown(content)}</div>`;
+    }
+  }
+
+  function renderMarkdown(src) {
+    const esc = (s) =>
+      String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    const codeBlocks = [];
+    src = String(src).replace(/```(\w*)\n([\s\S]*?)```/g, (m, lang, code) => {
+      codeBlocks.push(`<pre class="wb-code"><code>${esc(code)}</code></pre>`);
+      return `@@@CB${codeBlocks.length - 1}@@@`;
+    });
+    const inline = (t) => {
+      t = esc(t);
+      t = t.replace(/`([^`]+)`/g, (m, c) => `<code>${c}</code>`);
+      t = t.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+      t = t.replace(/\*([^*]+)\*/g, "<em>$1</em>");
+      t = t.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (m, txt, url) => {
+        const safe = /^(https?:|mailto:|#|\/|\.)/i.test(url) ? url : "#";
+        return `<a href="${encodeURI(safe)}" target="_blank" rel="noopener">${txt}</a>`;
+      });
+      return t;
+    };
+    const lines = src.split(/\r?\n/);
+    let html = "";
+    let inUl = false;
+    let inOl = false;
+    const closeLists = () => {
+      if (inUl) {
+        html += "</ul>";
+        inUl = false;
+      }
+      if (inOl) {
+        html += "</ol>";
+        inOl = false;
+      }
+    };
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const cb = line.match(/^@@@CB(\d+)@@@$/);
+      if (cb) {
+        closeLists();
+        html += codeBlocks[Number(cb[1])];
+        continue;
+      }
+      if (/^\s*$/.test(line)) {
+        closeLists();
+        continue;
+      }
+      let m;
+      if ((m = line.match(/^(#{1,6})\s+(.*)$/))) {
+        closeLists();
+        const lv = m[1].length;
+        html += `<h${lv}>${inline(m[2])}</h${lv}>`;
+      } else if (/^\s*([-*+])\s+/.test(line)) {
+        if (!inUl) {
+          closeLists();
+          html += "<ul>";
+          inUl = true;
+        }
+        html += `<li>${inline(line.replace(/^\s*[-*+]\s+/, ""))}</li>`;
+      } else if (/^\s*\d+\.\s+/.test(line)) {
+        if (!inOl) {
+          closeLists();
+          html += "<ol>";
+          inOl = true;
+        }
+        html += `<li>${inline(line.replace(/^\s*\d+\.\s+/, ""))}</li>`;
+      } else if (/^\s*>\s?/.test(line)) {
+        closeLists();
+        html += `<blockquote>${inline(line.replace(/^\s*>\s?/, ""))}</blockquote>`;
+      } else if (/^\s*(---|\*\*\*|___)\s*$/.test(line)) {
+        closeLists();
+        html += "<hr>";
+      } else {
+        closeLists();
+        html += `<p>${inline(line)}</p>`;
+      }
+    }
+    closeLists();
+    return html;
   }
 
   function renderMessagesHTML(conv) {
@@ -1036,6 +1279,9 @@
       const endTag = m.proposed_end
         ? '<div class="score-line">🔚 该角色提议结束对话，已发起全体投票</div>'
         : "";
+      const wbTag = m.wb_edited
+        ? '<div class="score-line">📝 更新了白板</div>'
+        : "";
       return `
         <div class="msg agent">
           <div class="avatar" style="background:${escapeHtml(a.color)}">${escapeHtml(a.initial)}</div>
@@ -1045,6 +1291,7 @@
             <div class="bubble">${escapeHtml(m.content)}</div>
             ${scoreLine}
             ${endTag}
+            ${wbTag}
           </div>
         </div>
       `;

@@ -24,13 +24,15 @@ python -m pytest -q      # 运行测试
   - `RUNNERS: dict[str, ConversationRunner]` 是**内存注册表**（模块级全局）。API 优先查 `RUNNERS`，未命中再从 SQLite 用 `ConversationRunner.from_payload()` 复活。
   - 状态机：`running` / `paused`（`paused_reason` 为 `manual` / `limit` / `vote_end` / `error`）/ `completed`。**唯一进入 `completed` 的路径是人类手动 `summarize_now()`**；达到 token/时长上限只转 `paused(limit)`，角色一致投票结束只转 `paused(vote_end)`，都不自动完成。
   - `resume()` 的放行条件是 `paused 且 not _limit_reached()`——所以 `vote_end`/`manual` 可直接继续；`limit` 必须先经 `POST /limits`（`update_limits`）把上限改大到超过已消耗才能续跑。`to_dict()` 的 `can_resume` 字段即前端「继续对话」按钮的开关。`_limit_reached` 有持锁/免锁两版（`_limit_reached_nolock` 供 `to_dict`/`resume` 在已持锁时调用，避免 `threading.Lock` 不可重入导致死锁）。
-  - 主动结束投票（item 3）：`end_vote_enabled` 时，`end_vote_proposers` 里的角色 system prompt 被追加「可输出 `END_PROPOSAL_MARKER` 提议结束」。`_run` 检测到 proposer 发言含该标记就**内联**（非独立线程，保持锁/持久化一致）跑 `_run_end_vote_inline()`——全体一致「同意结束」才转 `vote_end`，否则设 `_end_vote_block_until_turn` 冷却若干轮。该投票以 `kind:"end"` 记入 `votes`。
+  - **结构化回合输出**：agent 每个发言回合走 `llm.agent_turn()`，返回结构化 dict `{speech, propose_end, whiteboard_ops}`（JSON，防御式解析 `_parse_turn`，非 JSON 时整体当作 speech 兜底）。能力字段由 `_build_system` 按角色能力注入到 system 里——**新功能就加一个新字段，不要再用文本标记**。
+  - 主动结束投票（item 3）：`end_vote_enabled` 时，`end_vote_proposers` 里的角色 system 里声明 `propose_end` 字段；该角色某回合 `propose_end=true` 时，`_run` **内联**（非独立线程，保持锁/持久化一致）跑 `_run_end_vote_inline()`——全体一致「同意结束」才转 `vote_end`，否则设 `_end_vote_block_until_turn` 冷却若干轮。该投票以 `kind:"end"` 记入 `votes`。
+  - 白板（最终产出物）：`whiteboard_enabled` 时，`whiteboard_editors` 里的角色 system 里声明 `whiteboard` 字段并附上当前白板全文；其回合返回的 `whiteboard_ops`（增量 op：`append`/`replace`/`prepend`/`set`）由 `_apply_whiteboard_ops` **在同一回合内联应用**（发言→改白板→再继续，避免与下个发言者读写重叠）。白板状态 `whiteboard_content`/`whiteboard_rev`/`whiteboard_last_editor` 在 `to_dict` 的 `whiteboard` 块里；人类只读。`whiteboard_format` 为 `md`/`html`。
   - 时长统计用「分段累计」：`_active_seconds` + `_segment_start`，暂停时结算，避免把暂停时间计入。
   - `_persist()` 每步写回 SQLite，且吞掉持久化异常——不能让持久化失败杀死对话线程。
   - 人类发言二态：`running` 时 `human_say` 走 `pending_human_message` 下一轮注入；`paused` 时直接 append 到 messages 并持久化（立即可见）。可选 `target`（agent id/name）指定下一个发言者：running 时目标随 `pending_human_target` 一起入队，在**人类消息被追加的同一时刻**才置 `_forced_next_idx`（不能在 reserve 时就置，否则可能被正在进行的一次 agent 回合抢先消费，导致指定失效）；`_forced_next_idx` 在下一个 agent 回合被消费一次即清空，覆盖任何调度模式与 `forbid_consecutive`。
   - 投票（`start_vote` / `_run_vote`，人类发起）也在独立线程运行，只允许在非 `running` 状态发起。
 - [app/scheduler.py](app/scheduler.py) — 纯函数调度算法。`willingness_select` 用数值稳定的 softmax：`s_eff = (score - lam*heat)/tau`，`forbid_consecutive` 禁止连续发言，`update_heat` 指数衰减（gamma）防垄断。**2 人对话在 engine 里被强制改为 round_robin。**
-- [app/llm.py](app/llm.py) — 唯一的 LLM 出入口。每个用途（`speak`/`willingness_score`/`vote`/`summarize`/`assist`）都有独立方法且**各自带 mock 分支**。解析 LLM 输出很防御性（`_parse_score`/`_parse_vote`/`_extract_json` 处理各种畸形 JSON）。部分兼容服务不支持 `response_format`，`_call` 会去掉它重试。
+- [app/llm.py](app/llm.py) — 唯一的 LLM 出入口。每个用途（`agent_turn`（结构化发言回合）/`willingness_score`/`vote`/`summarize`/`assist`）都有独立方法且**各自带 mock 分支**。解析 LLM 输出很防御性（`_parse_turn`/`_parse_score`/`_parse_vote`/`_extract_json` 处理各种畸形 JSON）。部分兼容服务不支持 `response_format`，`_call` 会去掉它重试。（旧的纯文本 `speak` 仍保留但引擎已不用。）
 - [app/db.py](app/db.py) — sqlite3 直连，两张表 `configs` / `conversations`，业务字段统一塞进 `payload` JSON 列。全局 `_lock` 串行化写。`mark_stale_running_conversations()` 在启动时把残留的 `running` 标为 `paused`（进程重启后线程已丢失）。
 - [app/assistant.py](app/assistant.py) — 配置助手。多轮对话内存态存在 `sessions` dict，强制 LLM 只输出 `{"reply", "proposal"}` JSON；proposal 需前端人工确认后才应用。
 - [app/routes/api.py](app/routes/api.py) — 全部 REST 端点。模块级单例 `_llm` / `_assistant`。`_clean_config` 做入参校验。

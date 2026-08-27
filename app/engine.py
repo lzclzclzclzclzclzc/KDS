@@ -10,8 +10,6 @@ from app.db import update_conversation
 from app.llm import LLMClient
 from app.scheduler import update_heat, willingness_select
 
-END_PROPOSAL_MARKER = "【提议结束对话】"
-
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -73,6 +71,13 @@ class ConversationRunner:
         self.end_vote_enabled = bool(config.get("end_vote_enabled"))
         self.end_vote_proposers = list(config.get("end_vote_proposers") or [])
         self.end_vote_cooldown_turns = int(config.get("end_vote_cooldown_turns") or 3)
+
+        self.whiteboard_enabled = bool(config.get("whiteboard_enabled"))
+        self.whiteboard_format = config.get("whiteboard_format") or "md"
+        self.whiteboard_editors = list(config.get("whiteboard_editors") or [])
+        self.whiteboard_content = config.get("whiteboard_content") or ""
+        self.whiteboard_rev = 0
+        self.whiteboard_last_editor: Optional[str] = None
 
         self.messages: list[dict] = []
         self.heat = [0.0] * len(self.agents)
@@ -273,6 +278,14 @@ class ConversationRunner:
                 "ended_reason": self.ended_reason,
                 "can_resume": can_resume,
                 "votes": [dict(v) for v in self.votes],
+                "whiteboard": {
+                    "enabled": self.whiteboard_enabled,
+                    "format": self.whiteboard_format,
+                    "editors": list(self.whiteboard_editors),
+                    "content": self.whiteboard_content,
+                    "rev": self.whiteboard_rev,
+                    "last_editor": self.whiteboard_last_editor,
+                },
                 "config": {
                     "agents": [dict(a) for a in self.agents],
                     "shared_background": self.shared_background,
@@ -291,6 +304,9 @@ class ConversationRunner:
                     "end_vote_enabled": self.end_vote_enabled,
                     "end_vote_proposers": list(self.end_vote_proposers),
                     "end_vote_cooldown_turns": self.end_vote_cooldown_turns,
+                    "whiteboard_enabled": self.whiteboard_enabled,
+                    "whiteboard_format": self.whiteboard_format,
+                    "whiteboard_editors": list(self.whiteboard_editors),
                 },
                 "heat": list(self.heat),
                 "order": list(self.order),
@@ -337,6 +353,10 @@ class ConversationRunner:
         runner._end_vote_block_until_turn = int(conv.get("end_vote_block_until_turn", -1) or -1)
         fni = conv.get("forced_next_idx")
         runner._forced_next_idx = int(fni) if isinstance(fni, int) else None
+        wb = conv.get("whiteboard") or {}
+        runner.whiteboard_content = wb.get("content") or ""
+        runner.whiteboard_rev = int(wb.get("rev") or 0)
+        runner.whiteboard_last_editor = wb.get("last_editor")
         runner._active_seconds = float(conv.get("active_seconds", 0.0) or 0.0)
         runner._segment_start = None
         return runner
@@ -372,25 +392,80 @@ class ConversationRunner:
             return False
         return agent["id"] in self.end_vote_proposers or agent["name"] in self.end_vote_proposers
 
+    def _can_edit_whiteboard(self, agent: dict) -> bool:
+        if not self.whiteboard_enabled:
+            return False
+        return agent["id"] in self.whiteboard_editors or agent["name"] in self.whiteboard_editors
+
     def _build_system(self, agent: dict) -> str:
         base = self._build_persona(agent) + (
-            "\n\n你正在参与一场多人实时群聊。请以你角色的口吻，用中文自然发言，"
-            "直接输出发言内容，不要添加「某某说：」之类的前缀。"
+            "\n\n你正在参与一场多人实时群聊。请以你角色的口吻，用中文自然发言。"
         )
-        if self._is_proposer(agent):
+        can_end = self._is_proposer(agent)
+        can_wb = self._can_edit_whiteboard(agent)
+
+        fields = [
+            '"speech"：字符串，你本轮要说的话（用中文，直接说话，不要加「某某说：」之类前缀）',
+        ]
+        if can_end:
+            fields.append(
+                '"propose_end"：布尔值。若你认为这场对话可以结束了就设为 true，'
+                "这会发起一次全体投票，只有所有参与者都同意才会结束；不想结束就设为 false 或省略"
+            )
+        if can_wb:
+            fields.append(
+                '"whiteboard"：对象，用于对共享白板做增量修改；本轮不改就省略或设为 null。'
+                '格式为 {"ops": [...]}，每个 op 可为：'
+                '{"op":"append","content":"追加到白板末尾的内容"}、'
+                '{"op":"replace","find":"白板中已有的原文片段","replace":"替换后的新内容"}、'
+                '{"op":"prepend","content":"加到白板开头的内容"}'
+            )
+        base += (
+            "\n\n请只输出一个 JSON 对象，不要输出任何多余文字，包含以下字段：\n"
+            + "\n".join(f"- {f}" for f in fields)
+        )
+        if can_wb:
+            fmt = "HTML" if self.whiteboard_format == "html" else "Markdown"
+            current = self.whiteboard_content or "（当前白板为空）"
             base += (
-                "\n\n如果你认为这场对话可以自然结束了，可以在你发言的最后另起一行，单独输出标记 "
-                f"{END_PROPOSAL_MARKER} 。这会发起一次全体投票，只有所有参与者都同意才会结束对话；"
-                "只要有一人反对就继续。若你不希望结束，就不要输出这个标记。"
+                f"\n\n【共享白板】这是本次群聊要沉淀的最终产出物，格式为 {fmt}，"
+                "请在合适时机通过 whiteboard 字段逐步完善它。当前白板内容如下：\n"
+                f"---\n{current}\n---"
             )
         return base
 
     @staticmethod
-    def _extract_end_proposal(content: str) -> tuple[bool, str]:
-        if content and END_PROPOSAL_MARKER in content:
-            cleaned = content.replace(END_PROPOSAL_MARKER, "").strip()
-            return True, cleaned
-        return False, content
+    def _apply_whiteboard_ops(content: str, ops: list) -> str:
+        """Apply incremental whiteboard ops. Defensive: unknown/no-match ops are skipped."""
+        for op in ops:
+            if not isinstance(op, dict):
+                continue
+            kind = str(op.get("op") or "").lower()
+            if not kind:
+                if "find" in op or "replace" in op:
+                    kind = "replace"
+                elif "prepend" in op:
+                    kind = "prepend"
+                elif "append" in op or "content" in op:
+                    kind = "append"
+            if kind == "set":
+                content = str(op.get("content", ""))
+            elif kind == "append":
+                text = str(op.get("content", op.get("append", "")) or "")
+                if text:
+                    sep = "\n" if content and not content.endswith("\n") else ""
+                    content = content + sep + text
+            elif kind == "prepend":
+                text = str(op.get("content", op.get("prepend", "")) or "")
+                if text:
+                    sep = "\n" if content and not text.endswith("\n") else ""
+                    content = text + sep + content
+            elif kind == "replace":
+                find = str(op.get("find", "") or "")
+                repl = str(op.get("replace", op.get("with", op.get("content", ""))) or "")
+                if find and find in content:
+                    content = content.replace(find, repl, 1)
+        return content
 
     def _build_score_system(self, agent: dict) -> str:
         return self._build_persona(agent) + (
@@ -512,17 +587,28 @@ class ConversationRunner:
                 agent = self.agents[idx]
                 system = self._build_system(agent)
                 max_tokens = self.single_max_tokens
-                # Ask the model to keep within the limit (truncation is also enforced by max_tokens).
-                system += f"\n\n（单次发言请控制在约 {max_tokens} tokens 以内，超出部分会被系统截断。）"
-                content, usage = self.llm.speak(agent["name"], system, self._history(), max_tokens)
+                system += f"\n\n（其中 speech 字段请控制在约 {max_tokens} tokens 以内。）"
+                turn_out, usage = self.llm.agent_turn(agent["name"], system, self._history(), max_tokens)
 
-                proposed_end = False
-                if self._is_proposer(agent):
-                    proposed_end, content = self._extract_end_proposal(content)
+                speech = turn_out.get("speech") or ""
+                proposed_end = bool(turn_out.get("propose_end")) and self._is_proposer(agent)
+
+                # Edit the whiteboard within this same turn (before proceeding),
+                # so reads/writes never overlap with the next speaker.
+                wb_edited = False
+                ops = turn_out.get("whiteboard_ops") or []
+                if ops and self._can_edit_whiteboard(agent):
+                    with self._lock:
+                        new_content = self._apply_whiteboard_ops(self.whiteboard_content, ops)
+                        if new_content != self.whiteboard_content:
+                            self.whiteboard_content = new_content
+                            self.whiteboard_rev += 1
+                            self.whiteboard_last_editor = agent["name"]
+                            wb_edited = True
 
                 self._append_message(
-                    "agent", agent["name"], content, usage["completion_tokens"],
-                    scores=scores, proposed_end=proposed_end,
+                    "agent", agent["name"], speech, usage["completion_tokens"],
+                    scores=scores, proposed_end=proposed_end, wb_edited=wb_edited,
                 )
                 self.total_output_tokens += usage["completion_tokens"]
                 self.total_prompt_tokens += usage["prompt_tokens"]
@@ -767,7 +853,7 @@ class ConversationRunner:
                     vote["error"] = f"{exc}\n{traceback.format_exc()}"
             self._persist()
 
-    def _append_message(self, role: str, speaker: str, content: str, tokens: int, scores: Optional[list[dict]] = None, proposed_end: bool = False) -> None:
+    def _append_message(self, role: str, speaker: str, content: str, tokens: int, scores: Optional[list[dict]] = None, proposed_end: bool = False, wb_edited: bool = False) -> None:
         with self._lock:
             message = {
                 "role": role,
@@ -781,6 +867,8 @@ class ConversationRunner:
                 message["scores"] = scores
             if proposed_end:
                 message["proposed_end"] = True
+            if wb_edited:
+                message["wb_edited"] = True
             self.messages.append(message)
 
     def _persist(self) -> None:

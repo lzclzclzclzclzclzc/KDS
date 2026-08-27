@@ -23,13 +23,13 @@ def _config():
 
 def _slow_llm():
     llm = LLMClient(mock=True)
-    original = llm.speak
+    original = llm.agent_turn
 
-    def speak(name, system, history, max_tokens):
+    def agent_turn(name, system, history, max_tokens):
         time.sleep(0.02)
         return original(name, system, history, max_tokens)
 
-    llm.speak = speak
+    llm.agent_turn = agent_turn
     return llm
 
 
