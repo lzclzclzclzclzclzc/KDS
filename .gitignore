@@ -5,4 +5,4 @@ data/
 .venv/
 venv/
 .pytest_cache/
-
+design.md
