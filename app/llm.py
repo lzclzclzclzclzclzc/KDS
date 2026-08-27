@@ -53,6 +53,74 @@ def _parse_score(text: str, default: int = 50) -> int:
     return default
 
 
+def _extract_json(text: str):
+    text = (text or "").strip()
+    fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    if fence:
+        text = fence.group(1).strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        text = text[start : end + 1]
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
+def _parse_vote(text: str, options: list[str], votes_per_person: int) -> tuple[list[str], str]:
+    data = _extract_json(text)
+    raw = []
+    reason = ""
+    if isinstance(data, dict):
+        reason = str(data.get("reason") or "").strip()
+        for key in ("choices", "votes", "selections", "selection"):
+            if isinstance(data.get(key), list):
+                raw = data[key]
+                break
+        if not raw:
+            for key in ("choice", "vote", "selection"):
+                if data.get(key) is not None:
+                    raw = [data[key]]
+                    break
+
+    n = len(options)
+    labels = [str(i + 1) for i in range(n)]
+    text_to_label = {str(option).strip(): str(i + 1) for i, option in enumerate(options)}
+
+    def map_item(item):
+        if isinstance(item, dict):
+            for key in ("choice", "option", "vote", "selection"):
+                if key in item:
+                    item = item[key]
+                    break
+            else:
+                item = None
+        if item is None:
+            return None
+        value = str(item).strip()
+        if value in labels:
+            return value
+        if value in text_to_label:
+            return text_to_label[value]
+        match = re.search(r"\d+", value)
+        if match and match.group(0) in labels:
+            return match.group(0)
+        return None
+
+    choices = []
+    for item in raw:
+        choice = map_item(item)
+        if choice:
+            choices.append(choice)
+
+    if not choices and votes_per_person > 0:
+        choices = [labels[0]] * votes_per_person
+    while len(choices) < votes_per_person:
+        choices.append(choices[0])
+    return choices[:votes_per_person], reason
+
+
 class LLMClient:
     """Thin OpenAI-compatible client with an offline mock mode."""
 
@@ -163,6 +231,38 @@ class LLMClient:
         content, usage = self._call(messages, 0.3, max_tokens=1200)
         return content, usage
 
+    def vote(
+        self,
+        name: str,
+        system: str,
+        history_text: str,
+        question: str,
+        options: list[str],
+        votes_per_person: int,
+    ) -> tuple[dict, dict]:
+        if self.mock:
+            return self._mock_vote(name, options, votes_per_person)
+        options_text = "\n".join(f"{i + 1}. {o}" for i, o in enumerate(options))
+        messages = [
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": (
+                    "以下是当前对话记录：\n"
+                    + history_text
+                    + "\n\n请投票：\n"
+                    + question
+                    + "\n\n选项：\n"
+                    + options_text
+                    + f"\n\n你有 {votes_per_person} 票。请只输出 JSON 对象："
+                      '{"choices": ["选项编号"], "reason": "简短理由"}。'
+                ),
+            },
+        ]
+        content, usage = self._call(messages, self.score_temperature, max_tokens=700, json_mode=True)
+        choices, reason = _parse_vote(content, options, votes_per_person)
+        return {"choices": choices, "reason": reason}, usage
+
     def assist(self, messages: list[dict]) -> tuple[str, dict]:
         if self.mock:
             return self._mock_assist(messages)
@@ -170,6 +270,17 @@ class LLMClient:
         return content, usage
 
     # ---- Mock helpers ----
+
+    @staticmethod
+    def _mock_vote(name: str, options: list[str], votes_per_person: int) -> tuple[dict, dict]:
+        n = len(options)
+        seed = (sum(ord(c) for c in name) * 13 + votes_per_person * 7) % 100
+        choices = [str((seed + j) % n + 1) for j in range(votes_per_person)]
+        return {"choices": choices, "reason": "mock vote"}, {
+            "prompt_tokens": 0,
+            "completion_tokens": 12,
+            "total_tokens": 12,
+        }
 
     @staticmethod
     def _mock_speak(name: str, history: list[dict]) -> str:
@@ -216,6 +327,7 @@ class LLMClient:
 
         proposal = {
             "agents": {},
+            "single_max_tokens": 300,
             "shared_background": "这是一场围绕共同话题展开的轻松群聊，参与者可以自由表达观点。",
         }
         if names:
@@ -226,7 +338,6 @@ class LLMClient:
                     f"请根据以下要求调整你的说话风格与立场：{last_user[:80]}"
                 ),
                 "visibility": ["all"],
-                "max_tokens": 300,
             }
         return json.dumps({"reply": reply, "proposal": proposal}, ensure_ascii=False), {
             "prompt_tokens": 0,

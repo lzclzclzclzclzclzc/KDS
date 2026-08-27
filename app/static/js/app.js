@@ -27,6 +27,7 @@
         newAgent("a0", "小明"),
         newAgent("a1", "小红"),
       ],
+      single_max_tokens: 300,
       total_max_tokens: 20000,
       total_duration_seconds: 600,
       first_speaker: "random",
@@ -47,7 +48,6 @@
       name: name,
       system_prompt: "",
       visibility: [],
-      max_tokens: 300,
     };
   }
 
@@ -266,8 +266,11 @@
         name: a.name || "",
         system_prompt: a.system_prompt || "",
         visibility: a.visibility || [],
-        max_tokens: a.max_tokens || 300,
       })),
+      single_max_tokens:
+        cfg.single_max_tokens ||
+        ((cfg.agents || []).map((a) => Number(a.max_tokens) || 0).filter(Boolean)[0] ||
+          300),
       total_max_tokens: cfg.total_max_tokens || null,
       total_duration_seconds: cfg.total_duration_seconds || null,
       first_speaker: cfg.first_speaker || "random",
@@ -339,6 +342,13 @@
       </div>
 
       <div class="grid-2">
+        <div class="field">
+          <label>单人 max_token</label>
+          <input id="cfg-single-tokens" type="number" value="${
+            draft.single_max_tokens || 300
+          }" />
+          <div class="hint">每次发言的输出 token 上限，统一应用于所有角色。</div>
+        </div>
         <div class="field">
           <label>总输出 max_token</label>
           <input id="cfg-total-tokens" type="number" value="${
@@ -438,17 +448,13 @@
           <button class="remove-agent btn-ghost">删除</button>
         </div>
         <div class="field">
-          <label>system prompt（角色设定）</label>
+          <label>system prompt（角色设定） <button type="button" class="btn-ghost sync-prompt" data-sync-prompt>同步给所有人</button></label>
           <textarea class="agent-prompt">${escapeHtml(agent.system_prompt)}</textarea>
         </div>
         <div class="row" style="align-items:flex-start">
           <div class="field grow">
             <label>system prompt 对谁可见</label>
             <div class="vis-chips">${chips}</div>
-          </div>
-          <div class="field" style="width:120px">
-            <label>单次 max_token</label>
-            <input class="agent-max" type="number" value="${agent.max_tokens || 300}" />
           </div>
         </div>
       </div>
@@ -461,6 +467,7 @@
     const nameInput = $("cfg-name");
     const bgInput = $("cfg-bg");
     const totalTokens = $("cfg-total-tokens");
+    const singleTokens = $("cfg-single-tokens");
     const duration = $("cfg-duration");
     const firstSel = $("cfg-first");
     const modeSel = $("cfg-mode");
@@ -469,6 +476,9 @@
     bgInput.addEventListener("input", () => (draft.shared_background = bgInput.value));
     totalTokens.addEventListener("input", () => {
       draft.total_max_tokens = totalTokens.value ? Number(totalTokens.value) : null;
+    });
+    singleTokens.addEventListener("input", () => {
+      draft.single_max_tokens = Number(singleTokens.value) || 300;
     });
     duration.addEventListener("input", () => {
       draft.total_duration_seconds = duration.value ? Number(duration.value) : null;
@@ -515,8 +525,14 @@
       card.querySelector(".agent-prompt").addEventListener("input", (e) => {
         agent.system_prompt = e.target.value;
       });
-      card.querySelector(".agent-max").addEventListener("input", (e) => {
-        agent.max_tokens = Number(e.target.value) || 300;
+      card.querySelector("[data-sync-prompt]").addEventListener("click", () => {
+        if (draft.agents.length < 2) return;
+        const source = agent.system_prompt;
+        draft.agents.forEach((other) => {
+          if (other.id !== id) other.system_prompt = source;
+        });
+        renderConfigForm();
+        toast("已将该角色的 system prompt 同步给所有人");
       });
       card.querySelector(".remove-agent").addEventListener("click", () => {
         draft.agents = draft.agents.filter((a) => a.id !== id);
@@ -718,6 +734,9 @@
     if (proposal.shared_background != null) {
       draft.shared_background = proposal.shared_background;
     }
+    if (proposal.single_max_tokens != null) {
+      draft.single_max_tokens = Number(proposal.single_max_tokens);
+    }
     if (proposal.agents) {
       for (const name of Object.keys(proposal.agents)) {
         const agent = draft.agents.find((a) => a.name === name);
@@ -725,7 +744,6 @@
         const patch = proposal.agents[name];
         if (patch.system_prompt != null) agent.system_prompt = patch.system_prompt;
         if (patch.visibility != null) agent.visibility = patch.visibility;
-        if (patch.max_tokens != null) agent.max_tokens = Number(patch.max_tokens);
       }
     }
     renderConfigForm();
@@ -746,6 +764,7 @@
           <button class="back" data-back>‹</button>
           <div class="title" id="chat-title">加载中…</div>
           <div class="token-info" id="chat-tokens"></div>
+          <div id="chat-countdown" class="countdown"></div>
           <span id="chat-status" class="status-pill status-running">进行中</span>
           <div id="chat-actions"></div>
         </div>
@@ -765,6 +784,7 @@
       if (id === "chat-stop") stopChat();
       else if (id === "chat-resume") resumeChat();
       else if (id === "chat-summarize") summarizeChat();
+      else if (id === "chat-vote") showVoteModal();
     });
     app.querySelector("#chat-send").addEventListener("click", sendHumanMessage);
     app.querySelector("#chat-input").addEventListener("keydown", (e) => {
@@ -782,22 +802,51 @@
     }
   }
 
+  function updateCountdown(conv) {
+    const el = document.getElementById("chat-countdown");
+    if (!el) return;
+    if (
+      conv.status === "running" &&
+      conv.total_duration_seconds != null &&
+      conv.remaining_seconds != null
+    ) {
+      const seconds = Math.max(0, Math.floor(conv.remaining_seconds));
+      const mm = String(Math.floor(seconds / 60)).padStart(2, "0");
+      const ss = String(seconds % 60).padStart(2, "0");
+      el.textContent = `倒计时 ${mm}:${ss}`;
+      el.classList.toggle("countdown-warning", seconds <= 60);
+    } else {
+      el.textContent = "";
+      el.classList.remove("countdown-warning");
+    }
+  }
+
   async function pollChat() {
     if (!chatConvId) return;
     try {
       const conv = await api("/api/conversations/" + chatConvId);
+      updateCountdown(conv);
       const sig = JSON.stringify({
         s: conv.status,
         n: (conv.messages || []).length,
         last: conv.messages && conv.messages.length ? conv.messages[conv.messages.length - 1] : null,
         summary: conv.summary || "",
+        er: conv.ended_reason || "",
+        pr: conv.paused_reason || "",
+        v: conv.votes || [],
       });
       if (sig !== chatSig) {
         chatSig = sig;
         renderChatState(conv);
       }
-      if ((conv.status === "completed" || conv.status === "error") && window.chatTimer) {
+      const hasActiveVote = (conv.votes || []).some(
+        (v) => v.status === "pending" || v.status === "running"
+      );
+      if ((conv.status === "completed" || conv.status === "error") && !hasActiveVote && window.chatTimer) {
         clearChatTimer();
+      }
+      if (hasActiveVote && !window.chatTimer) {
+        window.chatTimer = setInterval(pollChat, 1000);
       }
     } catch (e) {
       // Transient polling error; keep trying until navigated away.
@@ -816,13 +865,19 @@
     const actions = document.getElementById("chat-actions");
     const isRunning = conv.status === "running";
     const isPaused = conv.status === "paused";
+    const isLimitPause = isPaused && conv.paused_reason === "limit";
+    const canVote =
+      isPaused || (conv.status === "completed" && conv.ended_reason === "limit");
 
     if (isRunning) {
       actions.innerHTML = '<button id="chat-stop" class="btn btn-danger">暂停</button>';
     } else if (isPaused) {
       actions.innerHTML =
-        '<button id="chat-resume" class="btn btn-primary">继续</button>' +
+        (isLimitPause ? "" : '<button id="chat-resume" class="btn btn-primary">继续</button>') +
+        '<button id="chat-vote" class="btn">投票</button>' +
         '<button id="chat-summarize" class="btn">总结</button>';
+    } else if (canVote) {
+      actions.innerHTML = '<button id="chat-vote" class="btn btn-primary">发起投票</button>';
     } else {
       actions.innerHTML = "";
     }
@@ -832,9 +887,11 @@
     input.disabled = !isRunning;
     input.placeholder = isRunning
       ? "预约下一轮发言（会跳过调度，直接发言）"
-      : isPaused
-        ? "对话已暂停，可继续或总结"
-        : "对话已结束";
+      : isLimitPause
+        ? "已达上限，可发起投票或总结"
+        : isPaused
+          ? "对话已暂停，可继续、投票或总结"
+          : "对话已结束";
     if (sendBtn) sendBtn.disabled = !isRunning;
 
     const box = document.getElementById("chat-messages");
@@ -853,34 +910,55 @@
       conv.scheduling_mode === "willingness" ? "按意愿调度" : "轮流发言"
     }</div></div>`;
 
-    (conv.messages || []).forEach((m) => {
+    const renderMessage = (m) => {
       if (m.role === "human") {
-        html += `
+        return `
           <div class="msg human">
             <div class="avatar" style="background:${escapeHtml(avatarColor("人类"))}">人</div>
             <div class="msg-body">
               <div class="speaker">人类 · 预约发言</div>
+              <div class="msg-time">${escapeHtml(fmtTime(m.ts))}</div>
               <div class="bubble">${escapeHtml(m.content)}</div>
             </div>
           </div>
         `;
+      }
+
+      const a = avatars[m.speaker] || {
+        color: avatarColor(m.speaker),
+        initial: m.speaker.slice(0, 1),
+      };
+      let scoreLine = "";
+      if (m.scores && m.scores.length) {
+        const parts = m.scores.map((s) => `${escapeHtml(s.name)} ${s.score}`).join(" · ");
+        scoreLine = `<div class="score-line">意愿分：${parts}</div>`;
+      }
+      return `
+        <div class="msg agent">
+          <div class="avatar" style="background:${escapeHtml(a.color)}">${escapeHtml(a.initial)}</div>
+          <div class="msg-body">
+            <div class="speaker">${escapeHtml(m.speaker)}</div>
+            <div class="msg-time">${escapeHtml(fmtTime(m.ts))}</div>
+            <div class="bubble">${escapeHtml(m.content)}</div>
+            ${scoreLine}
+          </div>
+        </div>
+      `;
+    };
+
+    const events = [];
+    (conv.messages || []).forEach((m) => {
+      events.push({ ts: m.ts || "", kind: "message", data: m });
+    });
+    (conv.votes || []).forEach((v) => {
+      events.push({ ts: v.created_at || "", kind: "vote", data: v });
+    });
+    events.sort((a, b) => String(a.ts || "").localeCompare(String(b.ts || "")));
+    events.forEach((event) => {
+      if (event.kind === "message") {
+        html += renderMessage(event.data);
       } else {
-        const a = avatars[m.speaker] || { color: avatarColor(m.speaker), initial: m.speaker.slice(0, 1) };
-        let scoreLine = "";
-        if (m.scores && m.scores.length) {
-          const parts = m.scores.map((s) => `${escapeHtml(s.name)} ${s.score}`).join(" · ");
-          scoreLine = `<div class="score-line">意愿分：${parts}</div>`;
-        }
-        html += `
-          <div class="msg agent">
-            <div class="avatar" style="background:${escapeHtml(a.color)}">${escapeHtml(a.initial)}</div>
-            <div class="msg-body">
-              <div class="speaker">${escapeHtml(m.speaker)}</div>
-              <div class="bubble">${escapeHtml(m.content)}</div>
-              ${scoreLine}
-            </div>
-          </div>
-        `;
+        html += voteBlockHTML(event.data);
       }
     });
 
@@ -957,6 +1035,174 @@
     } catch (e) {
       toast("总结失败：" + e.message);
     }
+  }
+
+  function closeVoteModal() {
+    const el = document.getElementById("vote-modal");
+    if (el) el.remove();
+  }
+
+  function showVoteModal() {
+    closeVoteModal();
+    const overlay = document.createElement("div");
+    overlay.id = "vote-modal";
+    overlay.className = "modal-overlay";
+    overlay.innerHTML = `
+      <div class="modal">
+        <div class="modal-head">
+          <strong>发起投票</strong>
+          <button type="button" class="btn-ghost" data-close>×</button>
+        </div>
+        <div class="modal-body">
+          <div class="field">
+            <label>投票题目</label>
+            <input id="vote-question" type="text" placeholder="请输入题干" />
+          </div>
+          <div class="field">
+            <label>选项（至少 2 个）</label>
+            <div id="vote-options"></div>
+            <button type="button" id="vote-add-option" class="btn btn-ghost" style="margin-top:6px">＋ 添加选项</button>
+          </div>
+          <div class="field">
+            <label>每人票数</label>
+            <input id="vote-tickets" type="number" value="1" min="1" max="20" />
+          </div>
+        </div>
+        <div class="modal-foot">
+          <button type="button" class="btn" data-cancel>取消</button>
+          <button type="button" id="vote-submit" class="btn btn-primary">发送投票</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+
+    let optionCount = 2;
+    function renderOptions() {
+      const box = overlay.querySelector("#vote-options");
+      box.innerHTML = "";
+      for (let i = 1; i <= optionCount; i++) {
+        const row = document.createElement("div");
+        row.className = "option-row";
+        row.innerHTML = `
+          <span class="option-index">${i}</span>
+          <input data-option="${i}" type="text" placeholder="选项 ${i}" />
+          <button type="button" data-remove-option="${i}" class="btn-ghost">删除</button>
+        `;
+        box.appendChild(row);
+      }
+    }
+    renderOptions();
+
+    overlay.querySelector("#vote-add-option").addEventListener("click", () => {
+      optionCount += 1;
+      renderOptions();
+    });
+    overlay.querySelector("#vote-options").addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-remove-option]");
+      if (btn && optionCount > 2) {
+        optionCount -= 1;
+        renderOptions();
+      }
+    });
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) closeVoteModal();
+    });
+    overlay.querySelector("[data-close]").addEventListener("click", closeVoteModal);
+    overlay.querySelector("[data-cancel]").addEventListener("click", closeVoteModal);
+    overlay.querySelector("#vote-submit").addEventListener("click", submitVote);
+  }
+
+  async function submitVote() {
+    const modal = document.getElementById("vote-modal");
+    if (!modal) return;
+    const question = modal.querySelector("#vote-question").value.trim();
+    const optionInputs = Array.from(modal.querySelectorAll("[data-option]")).sort(
+      (a, b) => Number(a.dataset.option) - Number(b.dataset.option)
+    );
+    const options = optionInputs.map((i) => i.value.trim()).filter(Boolean);
+    const votesPerPerson = Number(modal.querySelector("#vote-tickets").value) || 1;
+    if (!question) {
+      toast("请填写投票题目");
+      return;
+    }
+    if (options.length < 2) {
+      toast("至少需要 2 个有效选项");
+      return;
+    }
+    const btn = modal.querySelector("#vote-submit");
+    btn.disabled = true;
+    btn.textContent = "发送中…";
+    try {
+      await api("/api/conversations/" + chatConvId + "/votes", {
+        method: "POST",
+        body: JSON.stringify({
+          question,
+          options,
+          votes_per_person: votesPerPerson,
+        }),
+      });
+      toast("投票已发起，等待各角色投票");
+      closeVoteModal();
+      pollChat();
+    } catch (e) {
+      toast("发起投票失败：" + e.message);
+      btn.disabled = false;
+      btn.textContent = "发送投票";
+    }
+  }
+
+  function totalVotes(vote) {
+    return Object.values(vote.results || {}).reduce(
+      (sum, value) => sum + (Number(value) || 0),
+      0
+    );
+  }
+
+  function voteBlockHTML(vote) {
+    const statusText =
+      vote.status === "completed"
+        ? "已完成"
+        : vote.status === "error"
+          ? "失败"
+          : "投票中";
+    let resultsHtml = "";
+    const total = totalVotes(vote);
+    if (vote.results && Object.keys(vote.results).length) {
+      resultsHtml = (vote.options || [])
+        .map((option, idx) => {
+          const key = String(idx + 1);
+          const count = Number(vote.results[key]) || 0;
+          const pct = total > 0 ? Math.round((count / total) * 100) : 0;
+          return `
+            <div class="vote-result-row">
+              <span class="vote-option-label">${idx + 1}. ${escapeHtml(option)}</span>
+              <span class="vote-bar"><span style="width:${pct}%"></span></span>
+              <span class="vote-count">${count} 票</span>
+            </div>
+          `;
+        })
+        .join("");
+    } else {
+      resultsHtml = '<div class="vote-pending">等待各角色提交…</div>';
+    }
+    const ballots = (vote.ballots || [])
+      .map(
+        (b) =>
+          `<div class="vote-ballot"><strong>${escapeHtml(
+            b.agent_name
+          )}</strong> 投 ${(b.choices || [])
+            .map((c) => `选项 ${escapeHtml(c)}`)
+            .join("、")}</div>`
+      )
+      .join("");
+    return `
+      <div class="vote-block">
+        <div class="vote-head">🗳️ 投票 · ${statusText}</div>
+        <div class="vote-question">${escapeHtml(vote.question)}</div>
+        <div class="vote-options">${resultsHtml}</div>
+        ${ballots ? `<div class="vote-ballots">${ballots}</div>` : ""}
+      </div>
+    `;
   }
 
   // Handle leaving chat page.

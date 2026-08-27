@@ -26,7 +26,13 @@ def test_engine_runs_and_summarizes_with_mock():
     # Run synchronously by invoking the private loop in this thread.
     runner._run()
     state = runner.to_dict()
-    assert state["status"] in {"completed", "paused", "error"}
+    assert state["status"] == "paused"
+    assert state["paused_reason"] == "limit"
     assert len(state["messages"]) >= 2
-    assert state["summary"]
+    assert state["summary"] == ""
     assert state["total_output_tokens"] > 0
+
+    assert runner.summarize_now() is True
+    summarized = runner.to_dict()
+    assert summarized["status"] == "completed"
+    assert summarized["summary"]

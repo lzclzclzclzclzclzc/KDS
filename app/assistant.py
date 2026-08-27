@@ -9,12 +9,12 @@ from app.llm import LLMClient
 def _build_system(draft: dict) -> str:
     compact = {
         "shared_background": draft.get("shared_background", ""),
+        "single_max_tokens": draft.get("single_max_tokens", 300),
         "agents": [
             {
                 "name": a.get("name"),
                 "system_prompt": a.get("system_prompt", ""),
                 "visibility": a.get("visibility", []),
-                "max_tokens": a.get("max_tokens"),
             }
             for a in draft.get("agents", [])
         ],
@@ -26,14 +26,16 @@ def _build_system(draft: dict) -> str:
         + json.dumps(compact, ensure_ascii=False, indent=2)
         + "\n\n你的职责：\n"
         "1. 与用户多轮对话，澄清需求；\n"
-        "2. 根据用户要求，提出对角色 system prompt、可见性、单次发言 token 上限，"
+        "2. 根据用户要求，提出对角色 system prompt、可见性、统一单人 max_token，"
         "或共享背景的具体修改。\n\n"
         "你必须始终只输出一个 JSON 对象，格式如下：\n"
         '{"reply": "给用户的自然语言说明", '
-        '"proposal": {"agents": {"<角色名>": {"system_prompt": "...", "visibility": [...], "max_tokens": 数字}}, '
+        '"proposal": {"agents": {"<角色名>": {"system_prompt": "...", "visibility": [...]}}, '
+        '"single_max_tokens": 数字, '
         '"shared_background": "..."}}\n\n'
         "- proposal 可以为 null，表示本轮只是在澄清问题、没有修改建议。\n"
         "- agents 只包含需要修改的角色，键必须使用草稿中已有的角色名。\n"
+        "- 只有在需要修改统一单人 max_token 时，才在 proposal 中给出 single_max_tokens 字段。\n"
         "- 只有在需要修改共享背景时，才在 proposal 中给出 shared_background 字段。\n"
         "- 不要新增或删除角色，除非用户明确要求。"
     )

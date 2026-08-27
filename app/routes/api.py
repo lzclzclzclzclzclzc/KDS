@@ -42,12 +42,15 @@ def _clean_config(payload: dict) -> tuple[str, dict]:
                 "name": (a.get("name") or f"角色{i + 1}").strip(),
                 "system_prompt": a.get("system_prompt") or "",
                 "visibility": a.get("visibility") or [],
-                "max_tokens": int(a.get("max_tokens") or 300),
             }
         )
+    single_max_tokens = int(payload.get("single_max_tokens") or 300)
+    if single_max_tokens <= 0:
+        raise ValueError("单人 max_token 必须大于 0")
     config = {
         "shared_background": payload.get("shared_background") or "",
         "agents": cleaned_agents,
+        "single_max_tokens": single_max_tokens,
         "total_max_tokens": payload.get("total_max_tokens") or None,
         "total_duration_seconds": payload.get("total_duration_seconds") or None,
         "first_speaker": payload.get("first_speaker") or "random",
@@ -151,6 +154,7 @@ def conversations_create():
     config_payload = {
         "agents": config.get("agents", []),
         "shared_background": config.get("shared_background", ""),
+        "single_max_tokens": config.get("single_max_tokens") or 300,
         "total_max_tokens": config.get("total_max_tokens"),
         "total_duration_seconds": config.get("total_duration_seconds"),
         "first_speaker": config.get("first_speaker"),
@@ -174,6 +178,43 @@ def conversations_get(conv_id):
     if record is None:
         return _err("对话不存在", 404)
     return jsonify(record)
+
+
+@api_bp.post("/api/conversations/<conv_id>/votes")
+def conversations_create_vote(conv_id):
+    payload = request.get_json(silent=True) or {}
+    question = (payload.get("question") or "").strip()
+    raw_options = payload.get("options") or []
+    if not isinstance(raw_options, list):
+        return _err("投票选项必须是数组")
+    options = [str(o).strip() for o in raw_options if str(o).strip()]
+    if not question:
+        return _err("投票题目不能为空")
+    if len(options) < 2:
+        return _err("投票至少需要 2 个选项")
+    try:
+        votes_per_person = int(payload.get("votes_per_person") or 1)
+    except (TypeError, ValueError):
+        return _err("每人票数必须是整数")
+    if votes_per_person < 1:
+        return _err("每人票数至少为 1")
+    if votes_per_person > 20:
+        return _err("每人票数不能超过 20")
+
+    runner = RUNNERS.get(conv_id)
+    if runner is None:
+        record = get_conversation(conv_id)
+        if record is None:
+            return _err("对话不存在", 404)
+        if record.get("status") not in ("paused", "completed"):
+            return _err("当前状态不能发起投票", 409)
+        runner = ConversationRunner.from_payload(record, _llm)
+        RUNNERS[conv_id] = runner
+
+    vote = runner.start_vote(question, options, votes_per_person)
+    if vote is None:
+        return _err("当前状态不能发起投票", 409)
+    return jsonify(vote), 202
 
 
 @api_bp.post("/api/conversations/<conv_id>/reserve")
