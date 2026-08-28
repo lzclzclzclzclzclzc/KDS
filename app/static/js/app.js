@@ -16,6 +16,9 @@
   let draft = defaultDraft();
   let configId = null;
   let assistantSessionId = null;
+  let importConvs = [];
+  let importOutsideBound = false;
+  let convItems = [];
   let chatConvId = null;
   let chatConv = null;
   let chatSig = "";
@@ -159,6 +162,7 @@
           </div>
         </div>
         <div class="section-title">历史对话</div>
+        <input id="conv-search" class="conv-search hidden" type="text" placeholder="搜索历史对话…" autocomplete="off" />
         <div id="conversation-list" class="list"></div>
       </div>
     `;
@@ -173,41 +177,61 @@
   async function loadConversations() {
     const list = document.getElementById("conversation-list");
     try {
-      const items = await api("/api/conversations");
-      if (!items.length) {
-        list.innerHTML = '<div class="empty">还没有历史对话，先新建一个配置开始吧。</div>';
-        return;
-      }
-      list.innerHTML = items
-        .map(
-          (c) => `
-          <div class="list-item" data-id="${escapeHtml(c.id)}">
-            <div class="thumb">💬</div>
-            <div class="meta">
-              <div class="title">${escapeHtml(c.name)}</div>
-              <div class="sub">${escapeHtml(fmtTime(c.updated_at || c.created_at))} · ${c.turn || 0} 轮</div>
-            </div>
-            <span class="status-pill ${statusClass(c.status)}">${statusLabel(c.status)}</span>
-            <button class="btn-ghost list-delete" data-del="${escapeHtml(c.id)}" title="删除对话">🗑 删除</button>
-          </div>
-        `
-        )
-        .join("");
-      list.querySelectorAll(".list-item").forEach((el) => {
-        el.addEventListener("click", (e) => {
-          if (e.target.closest("[data-del]")) return;
-          location.hash = "#/chat/" + el.dataset.id;
-        });
-      });
-      list.querySelectorAll("[data-del]").forEach((btn) => {
-        btn.addEventListener("click", (e) => {
-          e.stopPropagation();
-          deleteConversation(btn.dataset.del);
-        });
-      });
+      convItems = await api("/api/conversations");
     } catch (e) {
       list.innerHTML = `<div class="empty">加载失败：${escapeHtml(e.message)}</div>`;
+      return;
     }
+    const search = document.getElementById("conv-search");
+    if (search) search.oninput = renderConvList;
+    renderConvList();
+  }
+
+  function renderConvList() {
+    const list = document.getElementById("conversation-list");
+    if (!list) return;
+    const search = document.getElementById("conv-search");
+    if (!convItems.length) {
+      if (search) search.classList.add("hidden");
+      list.innerHTML = '<div class="empty">还没有历史对话，先新建一个配置开始吧。</div>';
+      return;
+    }
+    if (search) search.classList.remove("hidden");
+    const q = search ? search.value.trim().toLowerCase() : "";
+    const matched = convItems.filter(
+      (c) => !q || String(c.name || "").toLowerCase().includes(q)
+    );
+    if (!matched.length) {
+      list.innerHTML = '<div class="empty">没有匹配的历史对话。</div>';
+      return;
+    }
+    list.innerHTML = matched
+      .map(
+        (c) => `
+        <div class="list-item" data-id="${escapeHtml(c.id)}">
+          <div class="thumb">💬</div>
+          <div class="meta">
+            <div class="title">${escapeHtml(c.name)}</div>
+            <div class="sub">${escapeHtml(fmtTime(c.updated_at || c.created_at))} · ${c.turn || 0} 轮</div>
+          </div>
+          <span class="status-pill ${statusClass(c.status)}">${statusLabel(c.status)}</span>
+          <button class="btn-ghost list-delete" data-del="${escapeHtml(c.id)}" title="删除对话">🗑 删除</button>
+        </div>
+      `
+      )
+      .join("");
+    list.querySelectorAll(".list-item").forEach((el) => {
+      el.addEventListener("click", (e) => {
+        if (e.target.closest("[data-del]")) return;
+        location.hash = "#/chat/" + el.dataset.id;
+      });
+    });
+    list.querySelectorAll("[data-del]").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        deleteConversation(btn.dataset.del);
+      });
+    });
   }
 
   async function deleteConversation(id) {
@@ -244,9 +268,10 @@
           <button class="btn btn-ghost" data-back>← 返回</button>
           <h2>${id ? "编辑配置" : "新建配置"}</h2>
           <span class="grow"></span>
-          <select id="import-config" class="hidden">
-            <option value="">导入历史配置…</option>
-          </select>
+          <div id="import-config" class="import-config hidden">
+            <input id="import-search" type="text" placeholder="导入历史配置…（可搜索）" autocomplete="off" />
+            <div id="import-menu" class="import-menu hidden"></div>
+          </div>
         </div>
         <div class="config-shell">
           <div class="config-main">
@@ -319,23 +344,74 @@
   }
 
   async function loadConfigOptions() {
-    const select = document.getElementById("import-config");
+    const box = document.getElementById("import-config");
+    const input = document.getElementById("import-search");
+    const menu = document.getElementById("import-menu");
+    if (!box || !input || !menu) return;
     try {
-      const items = await api("/api/configs");
-      select.classList.remove("hidden");
-      select.innerHTML =
-        '<option value="">导入历史配置…</option>' +
-        items
-          .map(
-            (c) =>
-              `<option value="${escapeHtml(c.id)}">${escapeHtml(c.name)}</option>`
-          )
-          .join("");
-      select.addEventListener("change", () => {
-        if (select.value) location.hash = "#/config/" + select.value;
-      });
+      // Source the list from existing conversations' config snapshots (not the
+      // mutable configs table): each conversation keeps its own immutable config,
+      // so deleted conversations drop out and every non-deleted version survives
+      // even when the underlying config record was overwritten.
+      importConvs = await api("/api/conversations");
     } catch (e) {
-      // Ignore; the import list is optional.
+      return; // the import list is optional
+    }
+    box.classList.remove("hidden");
+
+    const renderMenu = () => {
+      const q = input.value.trim().toLowerCase();
+      const matched = importConvs.filter(
+        (c) => !q || String(c.name || "").toLowerCase().includes(q)
+      );
+      if (!matched.length) {
+        menu.innerHTML = '<div class="import-empty">无匹配的历史对话</div>';
+        return;
+      }
+      menu.innerHTML = matched
+        .map(
+          (c) =>
+            `<div class="import-item" data-conv-id="${escapeHtml(c.id)}">
+               <span class="import-item-name">${escapeHtml(c.name)}</span>
+               <span class="import-item-date">${escapeHtml(fmtTime(c.updated_at || c.created_at))}</span>
+             </div>`
+        )
+        .join("");
+    };
+
+    input.onfocus = () => {
+      renderMenu();
+      menu.classList.remove("hidden");
+    };
+    input.oninput = () => {
+      renderMenu();
+      menu.classList.remove("hidden");
+    };
+    menu.onclick = async (e) => {
+      const item = e.target.closest("[data-conv-id]");
+      if (!item) return;
+      menu.classList.add("hidden");
+      input.value = "";
+      try {
+        const conv = await api("/api/conversations/" + item.dataset.convId);
+        draft = normalizeDraft(Object.assign({ name: conv.name }, conv.config || {}));
+        // Imported snapshot -> saving/running creates a NEW config, never
+        // overwrites the original, so versions keep accumulating.
+        configId = null;
+        renderConfigForm();
+        toast("已导入该对话的配置，可修改后保存或开始");
+      } catch (err) {
+        toast("导入失败：" + err.message);
+      }
+    };
+
+    if (!importOutsideBound) {
+      document.addEventListener("click", (e) => {
+        const b = document.getElementById("import-config");
+        const m = document.getElementById("import-menu");
+        if (b && m && !b.contains(e.target)) m.classList.add("hidden");
+      });
+      importOutsideBound = true;
     }
   }
 
