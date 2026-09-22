@@ -1,3 +1,4 @@
+import math
 import uuid
 
 from flask import Blueprint, jsonify, render_template, request
@@ -15,7 +16,7 @@ from app.db import (
     list_conversations,
     update_config,
 )
-from app.engine import RUNNERS, ConversationRunner
+from app.engine import RUNNERS, RUNNERS_LOCK, ConversationRunner
 from app.llm import LLMClient
 
 api_bp = Blueprint("api", __name__)
@@ -26,6 +27,20 @@ _assistant = AssistantManager(_llm)
 
 def _err(message: str, status: int = 400):
     return jsonify({"error": message}), status
+
+
+def _load_runner(conv_id: str, allowed_statuses: tuple[str, ...]) -> tuple[ConversationRunner | None, dict | None]:
+    """Reuse one runner when simultaneous requests revive a stored conversation."""
+    with RUNNERS_LOCK:
+        runner = RUNNERS.get(conv_id)
+        if runner is not None:
+            return runner, None
+        record = get_conversation(conv_id)
+        if record is None or record.get("status") not in allowed_statuses:
+            return None, record
+        runner = ConversationRunner.from_payload(record, _llm)
+        RUNNERS[conv_id] = runner
+        return runner, record
 
 
 def _clean_config(payload: dict) -> tuple[str, dict]:
@@ -45,7 +60,21 @@ def _clean_config(payload: dict) -> tuple[str, dict]:
                 "visibility": a.get("visibility") or [],
             }
         )
-    single_max_tokens = int(payload.get("single_max_tokens") or DEFAULT_SINGLE_MAX_TOKENS)
+    single_max_tokens_raw = payload.get("single_max_tokens")
+    if not single_max_tokens_raw:
+        legacy_limits = []
+        for agent in agents:
+            raw_limit = agent.get("max_tokens")
+            if raw_limit in (None, ""):
+                continue
+            try:
+                legacy_limits.append(int(raw_limit))
+            except (TypeError, ValueError):
+                raise ValueError("角色 max_tokens 必须是正整数") from None
+        if len(set(legacy_limits)) > 1:
+            raise ValueError("角色 max_tokens 不一致，请设置统一的 single_max_tokens")
+        single_max_tokens_raw = legacy_limits[0] if legacy_limits else DEFAULT_SINGLE_MAX_TOKENS
+    single_max_tokens = int(single_max_tokens_raw)
     if single_max_tokens <= 0:
         raise ValueError("单人 max_token 必须大于 0")
 
@@ -75,6 +104,31 @@ def _clean_config(payload: dict) -> tuple[str, dict]:
     if whiteboard_enabled and not whiteboard_editors:
         raise ValueError("启用白板时，至少需要选定一个可编辑的角色")
 
+    scheduler_params = payload.get("scheduler_params")
+    if scheduler_params is None:
+        scheduler_params = {}
+    if not isinstance(scheduler_params, dict):
+        raise ValueError("调度参数必须是对象")
+    cleaned_scheduler_params = {}
+    for key, default in (("lam", 2.0), ("tau", 1.5), ("gamma", 0.7)):
+        raw = scheduler_params.get(key, default)
+        if isinstance(raw, bool):
+            raise ValueError(f"调度参数 {key} 必须是有限数字")
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"调度参数 {key} 必须是有限数字") from None
+        if not math.isfinite(value):
+            raise ValueError(f"调度参数 {key} 必须是有限数字")
+        cleaned_scheduler_params[key] = value
+    if cleaned_scheduler_params["tau"] <= 0:
+        raise ValueError("调度参数 tau 必须大于 0")
+    if not 0 < cleaned_scheduler_params["gamma"] <= 1:
+        raise ValueError("调度参数 gamma 必须大于 0 且不超过 1")
+    cleaned_scheduler_params["forbid_consecutive"] = bool(
+        scheduler_params.get("forbid_consecutive", True)
+    )
+
     config = {
         "shared_background": payload.get("shared_background") or "",
         "agents": cleaned_agents,
@@ -84,7 +138,7 @@ def _clean_config(payload: dict) -> tuple[str, dict]:
         "first_speaker": payload.get("first_speaker") or "random",
         "scheduling_mode": payload.get("scheduling_mode") or "round_robin",
         "round_robin_order": payload.get("round_robin_order") or [],
-        "scheduler_params": payload.get("scheduler_params") or {},
+        "scheduler_params": cleaned_scheduler_params,
         "end_vote_enabled": end_vote_enabled,
         "end_vote_proposers": end_vote_proposers,
         "end_vote_cooldown_turns": end_vote_cooldown_turns,
@@ -205,7 +259,8 @@ def conversations_create():
     runner = ConversationRunner(conv_id, config_id, name, config_payload, _llm)
     initial = runner.to_dict()
     create_conversation(conv_id, config_id, name, initial, status="running")
-    RUNNERS[conv_id] = runner
+    with RUNNERS_LOCK:
+        RUNNERS[conv_id] = runner
     runner.start()
     return jsonify(initial), 201
 
@@ -241,15 +296,11 @@ def conversations_create_vote(conv_id):
     if votes_per_person > 20:
         return _err("每人票数不能超过 20")
 
-    runner = RUNNERS.get(conv_id)
+    runner, record = _load_runner(conv_id, ("paused", "completed"))
     if runner is None:
-        record = get_conversation(conv_id)
         if record is None:
             return _err("对话不存在", 404)
-        if record.get("status") not in ("paused", "completed"):
-            return _err("当前状态不能发起投票", 409)
-        runner = ConversationRunner.from_payload(record, _llm)
-        RUNNERS[conv_id] = runner
+        return _err("当前状态不能发起投票", 409)
 
     vote = runner.start_vote(question, options, votes_per_person)
     if vote is None:
@@ -263,15 +314,11 @@ def conversations_reserve(conv_id):
     content = (payload.get("content") or "").strip()
     if not content:
         return _err("发言内容不能为空")
-    runner = RUNNERS.get(conv_id)
+    runner, record = _load_runner(conv_id, ("paused",))
     if runner is None:
-        record = get_conversation(conv_id)
         if record is None:
             return _err("对话不存在", 404)
-        if record.get("status") != "paused":
-            return _err("该对话已结束，无法再发言", 409)
-        runner = ConversationRunner.from_payload(record, _llm)
-        RUNNERS[conv_id] = runner
+        return _err("该对话已结束，无法再发言", 409)
     raw_target = payload.get("target")
     target = str(raw_target) if raw_target else None
     result = runner.human_say(content, target=target)
@@ -291,15 +338,11 @@ def conversations_interrupt(conv_id):
 
 @api_bp.post("/api/conversations/<conv_id>/resume")
 def conversations_resume(conv_id):
-    runner = RUNNERS.get(conv_id)
+    runner, record = _load_runner(conv_id, ("paused",))
     if runner is None:
-        record = get_conversation(conv_id)
         if record is None:
             return _err("对话不存在", 404)
-        if record.get("status") != "paused":
-            return _err("该对话无法恢复", 409)
-        runner = ConversationRunner.from_payload(record, _llm)
-        RUNNERS[conv_id] = runner
+        return _err("该对话无法恢复", 409)
     if not runner.resume():
         return _err("该对话当前无法恢复（可能已结束或正在运行）", 409)
     return jsonify({"ok": True, "status": runner.to_dict()["status"]})
@@ -324,15 +367,11 @@ def conversations_update_limits(conv_id):
     if total_max_tokens is None and total_duration_seconds is None:
         return _err("总输出 max_token 和总对话时长不能同时为无限，至少设置一个")
 
-    runner = RUNNERS.get(conv_id)
+    runner, record = _load_runner(conv_id, ("paused",))
     if runner is None:
-        record = get_conversation(conv_id)
         if record is None:
             return _err("对话不存在", 404)
-        if record.get("status") != "paused":
-            return _err("当前状态不能修改上限", 409)
-        runner = ConversationRunner.from_payload(record, _llm)
-        RUNNERS[conv_id] = runner
+        return _err("当前状态不能修改上限", 409)
 
     snapshot = runner.to_dict()
     used_tokens = snapshot.get("total_output_tokens") or 0
@@ -349,15 +388,11 @@ def conversations_update_limits(conv_id):
 
 @api_bp.post("/api/conversations/<conv_id>/summarize")
 def conversations_summarize(conv_id):
-    runner = RUNNERS.get(conv_id)
+    runner, record = _load_runner(conv_id, ("paused",))
     if runner is None:
-        record = get_conversation(conv_id)
         if record is None:
             return _err("对话不存在", 404)
-        if record.get("status") != "paused":
-            return _err("该对话无法总结", 409)
-        runner = ConversationRunner.from_payload(record, _llm)
-        RUNNERS[conv_id] = runner
+        return _err("该对话无法总结", 409)
     if not runner.summarize_now():
         return _err("该对话当前无法总结（可能已结束或正在运行）", 409)
     return jsonify(runner.to_dict())
@@ -365,10 +400,11 @@ def conversations_summarize(conv_id):
 
 @api_bp.delete("/api/conversations/<conv_id>")
 def conversations_delete(conv_id):
-    runner = RUNNERS.pop(conv_id, None)
-    if runner is not None:
-        runner.interrupt()
-    ok = delete_conversation(conv_id)
+    with RUNNERS_LOCK:
+        runner = RUNNERS.pop(conv_id, None)
+        if runner is not None:
+            runner.interrupt()
+        ok = delete_conversation(conv_id)
     if not ok:
         return _err("对话不存在", 404)
     return jsonify({"ok": True})

@@ -120,9 +120,9 @@ def test_parse_vote_under_count_padded_with_first_choice():
     assert choices == ["2", "2", "2"]
 
 
-def test_parse_vote_empty_defaults_to_first_label_padding():
+def test_parse_vote_empty_abstains_instead_of_selecting_first_option():
     choices, reason = _parse_vote("not json at all", OPTIONS, 2)
-    assert choices == ["1", "1"]
+    assert choices == []
     assert reason == ""
 
 

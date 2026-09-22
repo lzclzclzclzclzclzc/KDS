@@ -527,11 +527,11 @@
           </div>
           <div class="field">
             <label>τ 温度</label>
-            <input id="cfg-tau" type="number" step="0.1" value="${draft.scheduler_params.tau}" />
+            <input id="cfg-tau" type="number" min="0.001" step="any" value="${draft.scheduler_params.tau}" />
           </div>
           <div class="field">
             <label>γ 衰减</label>
-            <input id="cfg-gamma" type="number" step="0.1" value="${draft.scheduler_params.gamma}" />
+            <input id="cfg-gamma" type="number" min="0.001" max="1" step="any" value="${draft.scheduler_params.gamma}" />
           </div>
           <div class="field">
             <label>禁止连续发言</label>
@@ -974,6 +974,7 @@
 
   // ---------------- Chat page ----------------
   function renderChat(id) {
+    clearChatTimer();
     if (!id) {
       location.hash = "#/";
       return;
@@ -1097,10 +1098,13 @@
 
   async function pollChat() {
     if (!chatConvId) return;
+    const requestedId = chatConvId;
     try {
-      const conv = await api("/api/conversations/" + chatConvId);
+      const conv = await api("/api/conversations/" + requestedId);
+      if (requestedId !== chatConvId) return;
       chatConv = conv;
       updateCountdown(conv);
+      updateTokenInfo(conv);
       const sig = JSON.stringify({
         s: conv.status,
         n: (conv.messages || []).length,
@@ -1130,11 +1134,15 @@
     }
   }
 
-  function renderChatState(conv) {
-    document.getElementById("chat-title").textContent = conv.name || "群聊";
+  function updateTokenInfo(conv) {
     const tokenInfo = document.getElementById("chat-tokens");
+    if (!tokenInfo) return;
     const maxTokens = conv.total_max_tokens != null ? conv.total_max_tokens : "∞";
     tokenInfo.textContent = `输出 ${conv.total_output_tokens || 0} / ${maxTokens} tokens`;
+  }
+
+  function renderChatState(conv) {
+    document.getElementById("chat-title").textContent = conv.name || "群聊";
     const statusEl = document.getElementById("chat-status");
     statusEl.textContent = statusLabel(conv.status);
     statusEl.className = "status-pill " + statusClass(conv.status);

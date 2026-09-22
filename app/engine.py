@@ -100,7 +100,11 @@ class ConversationRunner:
         self._forced_next_idx: Optional[int] = None
         self._interrupt_requested = False
         self._lock = threading.Lock()
+        self._persist_lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
+        self._vote_thread: Optional[threading.Thread] = None
+        self._vote_in_progress = False
+        self._summary_in_progress = False
 
         self._active_seconds = 0.0
         self._segment_start: Optional[float] = None
@@ -164,7 +168,8 @@ class ConversationRunner:
     def resume(self) -> bool:
         old_thread = None
         with self._lock:
-            if self.status != "paused" or self._limit_reached_nolock():
+            if (self.status != "paused" or self._limit_reached_nolock()
+                    or self._vote_in_progress or self._summary_in_progress):
                 return False
             old_thread = self._thread
         if old_thread is not None and old_thread.is_alive():
@@ -172,7 +177,8 @@ class ConversationRunner:
             if old_thread.is_alive():
                 return False
         with self._lock:
-            if self.status != "paused":
+            if (self.status != "paused" or self._limit_reached_nolock()
+                    or self._vote_in_progress or self._summary_in_progress):
                 return False
             self.status = "running"
             self._interrupt_requested = False
@@ -184,7 +190,7 @@ class ConversationRunner:
     def summarize_now(self) -> bool:
         old_thread = None
         with self._lock:
-            if self.status not in ("paused",):
+            if self.status != "paused" or self._vote_in_progress or self._summary_in_progress:
                 return False
             old_thread = self._thread
         if old_thread is not None and old_thread.is_alive():
@@ -192,9 +198,14 @@ class ConversationRunner:
             if old_thread.is_alive():
                 return False
         with self._lock:
-            if self.status not in ("paused",):
+            if self.status != "paused" or self._vote_in_progress or self._summary_in_progress:
                 return False
-        self._finish("completed")
+            self._summary_in_progress = True
+        try:
+            self._finish("completed")
+        finally:
+            with self._lock:
+                self._summary_in_progress = False
         return True
 
     def reserve(self, content: str) -> None:
@@ -217,21 +228,19 @@ class ConversationRunner:
         """
         target_idx = self._resolve_agent_idx(target)
         with self._lock:
-            status = self.status
-        if status == "running":
-            with self._lock:
+            if self.status == "running":
                 self.pending_human_message = content
                 self.pending_human_target = target_idx
-            return "reserved"
-        if status == "paused":
-            self._append_message("human", "人类", content, 0)
-            with self._lock:
+                return "reserved"
+            if self.status == "paused" and not self._summary_in_progress:
+                self._append_message_nolock("human", "人类", content, 0)
                 self.turn += 1
                 if target_idx is not None:
                     self._forced_next_idx = target_idx
-            self._persist()
-            return "appended"
-        return None
+            else:
+                return None
+        self._persist()
+        return "appended"
 
     def update_limits(
         self, total_max_tokens: Optional[int], total_duration_seconds: Optional[int]
@@ -310,11 +319,12 @@ class ConversationRunner:
                 },
                 "heat": list(self.heat),
                 "order": list(self.order),
+                "first_idx": self.first_idx,
                 "rr_index": self._rr_index,
                 "end_vote_block_until_turn": self._end_vote_block_until_turn,
                 "forced_next_idx": self._forced_next_idx,
                 "last_agent_idx": self.last_agent_idx,
-                "active_seconds": self._active_seconds,
+                "active_seconds": active_seconds,
                 "elapsed_seconds": round(active_seconds, 1),
                 "remaining_seconds": (
                     round(remaining_seconds, 1)
@@ -349,6 +359,9 @@ class ConversationRunner:
         order = conv.get("order")
         if order and len(order) == len(runner.agents):
             runner.order = [int(x) for x in order]
+        first_idx = conv.get("first_idx")
+        if isinstance(first_idx, int) and 0 <= first_idx < len(runner.agents):
+            runner.first_idx = first_idx
         runner._rr_index = int(conv.get("rr_index", 0) or 0) % max(1, len(runner.order))
         runner._end_vote_block_until_turn = int(conv.get("end_vote_block_until_turn", -1) or -1)
         fni = conv.get("forced_next_idx")
@@ -357,7 +370,10 @@ class ConversationRunner:
         runner.whiteboard_content = wb.get("content") or ""
         runner.whiteboard_rev = int(wb.get("rev") or 0)
         runner.whiteboard_last_editor = wb.get("last_editor")
-        runner._active_seconds = float(conv.get("active_seconds", 0.0) or 0.0)
+        runner._active_seconds = max(
+            float(conv.get("active_seconds", 0.0) or 0.0),
+            float(conv.get("elapsed_seconds", 0.0) or 0.0),
+        )
         runner._segment_start = None
         return runner
 
@@ -487,13 +503,15 @@ class ConversationRunner:
     def _willingness_choose(self) -> tuple[int, list[dict]]:
         raw_scores: list[float] = []
         score_details: list[dict] = []
+        log_text = self._log_text()
         for a in self.agents:
             system = self._build_score_system(a)
-            score, usage = self.llm.willingness_score(a["name"], system, self._log_text(), self.turn)
+            score, usage = self.llm.willingness_score(a["name"], system, log_text, self.turn)
             raw_scores.append(score)
             score_details.append({"name": a["name"], "score": score})
-            self.total_output_tokens += usage["completion_tokens"]
-            self.total_prompt_tokens += usage["prompt_tokens"]
+            with self._lock:
+                self.total_output_tokens += usage["completion_tokens"]
+                self.total_prompt_tokens += usage["prompt_tokens"]
         idx = willingness_select(
             raw_scores,
             self.heat,
@@ -557,8 +575,8 @@ class ConversationRunner:
                         self.pending_human_target = None
 
                 if human_msg is not None:
-                    self._append_message("human", "人类", human_msg, 0)
                     with self._lock:
+                        self._append_message_nolock("human", "人类", human_msg, 0)
                         self.turn += 1
                         if human_target is not None:
                             self._forced_next_idx = human_target
@@ -576,8 +594,9 @@ class ConversationRunner:
                 if forced_idx is not None:
                     idx = forced_idx
                 elif self.scheduling_mode == "round_robin":
-                    idx = self.order[self._rr_index % len(self.order)]
-                    self._rr_index += 1
+                    with self._lock:
+                        idx = self.order[self._rr_index % len(self.order)]
+                        self._rr_index += 1
                 else:
                     if self.turn == 0:
                         idx = self.first_idx
@@ -606,23 +625,26 @@ class ConversationRunner:
                             self.whiteboard_last_editor = agent["name"]
                             wb_edited = True
 
-                self._append_message(
-                    "agent", agent["name"], speech, usage["completion_tokens"],
-                    scores=scores, proposed_end=proposed_end, wb_edited=wb_edited,
-                )
-                self.total_output_tokens += usage["completion_tokens"]
-                self.total_prompt_tokens += usage["prompt_tokens"]
-                self.heat = update_heat(self.heat, idx, self.gamma)
-                self.last_agent_idx = idx
                 with self._lock:
+                    self._append_message_nolock(
+                        "agent", agent["name"], speech, usage["completion_tokens"],
+                        scores=scores, proposed_end=proposed_end, wb_edited=wb_edited,
+                    )
+                    self.total_output_tokens += usage["completion_tokens"]
+                    self.total_prompt_tokens += usage["prompt_tokens"]
+                    self.heat = update_heat(self.heat, idx, self.gamma)
+                    self.last_agent_idx = idx
                     self.turn += 1
                 self._persist()
 
-                if proposed_end and self.turn > self._end_vote_block_until_turn:
+                with self._lock:
+                    should_vote = proposed_end and self.turn > self._end_vote_block_until_turn
+                if should_vote:
                     if self._run_end_vote_inline():
                         end_voted = True
                         break
-                    self._end_vote_block_until_turn = self.turn + self.end_vote_cooldown_turns
+                    with self._lock:
+                        self._end_vote_block_until_turn = self.turn + self.end_vote_cooldown_turns
 
             with self._lock:
                 was_interrupted = self._interrupt_requested
@@ -659,13 +681,16 @@ class ConversationRunner:
         if log_text.strip():
             try:
                 content, usage = self.llm.summarize(log_text)
-                self.summary = content
-                self.total_output_tokens += usage["completion_tokens"]
-                self.total_prompt_tokens += usage["prompt_tokens"]
+                with self._lock:
+                    self.summary = content
+                    self.total_output_tokens += usage["completion_tokens"]
+                    self.total_prompt_tokens += usage["prompt_tokens"]
             except Exception as exc:
-                self.summary = f"总结失败：{exc}"
+                with self._lock:
+                    self.summary = f"总结失败：{exc}"
         else:
-            self.summary = "本次对话没有任何发言。"
+            with self._lock:
+                self.summary = "本次对话没有任何发言。"
         self._persist()
 
     def _run_end_vote_inline(self) -> bool:
@@ -705,8 +730,9 @@ class ConversationRunner:
                 result, usage = self.llm.vote(
                     agent["name"], system, self._log_text(), question, options, 1
                 )
-                self.total_output_tokens += usage["completion_tokens"]
-                self.total_prompt_tokens += usage["prompt_tokens"]
+                with self._lock:
+                    self.total_output_tokens += usage["completion_tokens"]
+                    self.total_prompt_tokens += usage["prompt_tokens"]
                 choices = result.get("choices") or []
                 reason = result.get("reason", "") or ""
                 for choice in choices:
@@ -763,10 +789,10 @@ class ConversationRunner:
         options = [str(o).strip() for o in (options or []) if str(o).strip()]
         if not question or len(options) < 2 or int(votes_per_person) < 1:
             return None
-        vote_id = f"v{len(self.votes) + 1}"
         with self._lock:
-            if self.status == "running":
+            if self.status == "running" or self._vote_in_progress or self._summary_in_progress:
                 return None
+            vote_id = f"v{len(self.votes) + 1}"
             vote = {
                 "id": vote_id,
                 "question": question,
@@ -779,17 +805,35 @@ class ConversationRunner:
                 "error": None,
             }
             self.votes.append(vote)
+            self._vote_in_progress = True
+            thread = threading.Thread(
+                target=self._run_vote,
+                args=(vote_id,),
+                name=f"vote-{self.id}-{vote_id}",
+                daemon=True,
+            )
+            self._vote_thread = thread
         self._persist()
-        thread = threading.Thread(
-            target=self._run_vote,
-            args=(vote_id,),
-            name=f"vote-{self.id}-{vote_id}",
-            daemon=True,
-        )
-        thread.start()
+        try:
+            thread.start()
+        except RuntimeError:
+            with self._lock:
+                vote["status"] = "error"
+                vote["error"] = "投票线程启动失败"
+                self._vote_in_progress = False
+                self._vote_thread = None
+            self._persist()
+            return None
         return dict(vote)
 
     def _run_vote(self, vote_id: str) -> None:
+        try:
+            self._run_vote_inner(vote_id)
+        finally:
+            with self._lock:
+                self._vote_in_progress = False
+
+    def _run_vote_inner(self, vote_id: str) -> None:
         with self._lock:
             vote = next((v for v in self.votes if v["id"] == vote_id), None)
             if vote is None:
@@ -802,6 +846,8 @@ class ConversationRunner:
         results = {str(i + 1): 0 for i in range(len(vote["options"]))}
         ballots = []
         try:
+            with self._lock:
+                history_text = self._log_text()
             for agent in self.agents:
                 system = self._build_vote_system(
                     agent,
@@ -812,11 +858,14 @@ class ConversationRunner:
                 result, usage = self.llm.vote(
                     agent["name"],
                     system,
-                    self._log_text(),
+                    history_text,
                     vote["question"],
                     vote["options"],
                     vote["votes_per_person"],
                 )
+                with self._lock:
+                    self.total_output_tokens += usage["completion_tokens"]
+                    self.total_prompt_tokens += usage["prompt_tokens"]
                 choices = result.get("choices") or []
                 reason = result.get("reason", "") or ""
                 for choice in choices:
@@ -855,28 +904,34 @@ class ConversationRunner:
 
     def _append_message(self, role: str, speaker: str, content: str, tokens: int, scores: Optional[list[dict]] = None, proposed_end: bool = False, wb_edited: bool = False) -> None:
         with self._lock:
-            message = {
-                "role": role,
-                "speaker": speaker,
-                "content": content,
-                "tokens": tokens,
-                "ts": _now(),
-                "round": self.turn,
-            }
-            if scores is not None:
-                message["scores"] = scores
-            if proposed_end:
-                message["proposed_end"] = True
-            if wb_edited:
-                message["wb_edited"] = True
-            self.messages.append(message)
+            self._append_message_nolock(role, speaker, content, tokens, scores, proposed_end, wb_edited)
+
+    def _append_message_nolock(self, role: str, speaker: str, content: str, tokens: int, scores: Optional[list[dict]] = None, proposed_end: bool = False, wb_edited: bool = False) -> None:
+        message = {
+            "role": role,
+            "speaker": speaker,
+            "content": content,
+            "tokens": tokens,
+            "ts": _now(),
+            "round": self.turn,
+        }
+        if scores is not None:
+            message["scores"] = scores
+        if proposed_end:
+            message["proposed_end"] = True
+        if wb_edited:
+            message["wb_edited"] = True
+        self.messages.append(message)
 
     def _persist(self) -> None:
         try:
-            update_conversation(self.id, self.to_dict(), status=self.status)
+            with self._persist_lock:
+                snapshot = self.to_dict()
+                update_conversation(self.id, snapshot, status=snapshot["status"])
         except Exception:
             # Persistence failures should not kill the conversation thread.
             pass
 
 
 RUNNERS: dict[str, ConversationRunner] = {}
+RUNNERS_LOCK = threading.Lock()

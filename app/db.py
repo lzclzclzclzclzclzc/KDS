@@ -208,19 +208,49 @@ def delete_conversation(record_id: str) -> bool:
 
 
 def mark_stale_running_conversations() -> None:
-    """Mark conversations left in 'running' state as paused (e.g. after a restart)."""
+    """Recover conversations and votes whose worker threads ended on restart."""
     with _lock:
         conn = _connect(DB_PATH)
         try:
-            rows = conn.execute("SELECT id, payload FROM conversations WHERE status = 'running'").fetchall()
+            rows = conn.execute("SELECT id, payload, status FROM conversations").fetchall()
             now = _now()
             for row in rows:
                 payload = json.loads(row["payload"])
-                payload["status"] = "paused"
-                payload["ended_at"] = None
+                changed = False
+                if row["status"] == "running":
+                    active_seconds = max(
+                        float(payload.get("active_seconds") or 0),
+                        float(payload.get("elapsed_seconds") or 0),
+                    )
+                    total_max_tokens = payload.get("total_max_tokens")
+                    total_duration_seconds = payload.get("total_duration_seconds")
+                    limit_reached = (
+                        (total_max_tokens is not None
+                         and payload.get("total_output_tokens", 0) >= total_max_tokens)
+                        or (total_duration_seconds is not None
+                            and active_seconds >= total_duration_seconds)
+                    )
+                    payload["status"] = "paused"
+                    payload["ended_at"] = None
+                    payload["active_seconds"] = active_seconds
+                    payload["elapsed_seconds"] = round(active_seconds, 1)
+                    payload["remaining_seconds"] = (
+                        round(max(0.0, total_duration_seconds - active_seconds), 1)
+                        if total_duration_seconds is not None else None
+                    )
+                    payload["paused_reason"] = "limit" if limit_reached else "manual"
+                    payload["can_resume"] = not limit_reached
+                    changed = True
+                for vote in payload.get("votes") or []:
+                    if vote.get("status") in ("pending", "running"):
+                        vote["status"] = "error"
+                        vote["error"] = "服务重启，投票已中断，请重新发起"
+                        changed = True
+                if not changed:
+                    continue
                 conn.execute(
-                    "UPDATE conversations SET status = 'paused', payload = ?, updated_at = ? WHERE id = ?",
-                    (json.dumps(payload, ensure_ascii=False), now, row["id"]),
+                    "UPDATE conversations SET status = ?, payload = ?, updated_at = ? WHERE id = ?",
+                    (payload["status"], json.dumps(payload, ensure_ascii=False), now, row["id"]),
                 )
             conn.commit()
         finally:

@@ -114,8 +114,8 @@ def _parse_vote(text: str, options: list[str], votes_per_person: int) -> tuple[l
         if choice:
             choices.append(choice)
 
-    if not choices and votes_per_person > 0:
-        choices = [labels[0]] * votes_per_person
+    if not choices:
+        return [], reason
     while len(choices) < votes_per_person:
         choices.append(choices[0])
     return choices[:votes_per_person], reason
@@ -362,7 +362,7 @@ class LLMClient:
             "我倾向于先做个最小方案，再逐步迭代。",
             "能不能请上一个发言的人再展开讲一下？",
         ]
-        idx = (len(history) + hash(name) * 3) % len(phrases)
+        idx = (len(history) + sum(ord(c) for c in name) * 3) % len(phrases)
         return f"{phrases[idx]}（第{round_no}轮发言）"
 
     @staticmethod
