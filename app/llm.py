@@ -1,4 +1,5 @@
 import json
+import math
 import random
 import re
 from typing import Optional
@@ -54,18 +55,50 @@ def _parse_score(text: str, default: int = 50) -> int:
 
 
 def _extract_json(text: str):
-    text = (text or "").strip()
-    fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
-    if fence:
-        text = fence.group(1).strip()
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        text = text[start : end + 1]
-    try:
-        return json.loads(text)
-    except Exception:
+    """Decode JSON without treating Markdown inside JSON strings as delimiters.
+
+    Accept a whole JSON value or one container surrounded by prose/fences.
+    Do not salvage nested objects from a malformed outer object, or silently
+    choose between multiple objects. Those cases need explicit correction.
+    """
+    if not isinstance(text, str):
         return None
+    text = text.strip().lstrip("\ufeff").strip()
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+
+    def reject_constant(_value):
+        raise ValueError("non-finite JSON number")
+
+    def finite_float(value):
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError("non-finite JSON number")
+        return number
+
+    decoder = json.JSONDecoder(object_pairs_hook=unique_object, parse_constant=reject_constant,
+                               parse_float=finite_float)
+    try:
+        return decoder.decode(text)
+    except (ValueError, RecursionError):
+        pass
+    start = re.search(r"[\{\[]", text)
+    if start is None:
+        return None
+    try:
+        value, end = decoder.raw_decode(text, start.start())
+    except (ValueError, RecursionError):
+        return None
+    # Extra container starts could be another answer or a malformed suffix.
+    if re.search(r"[\{\}\[\]]", text[end:]):
+        return None
+    return value
 
 
 def _parse_vote(text: str, options: list[str], votes_per_person: int) -> tuple[list[str], str]:

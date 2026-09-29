@@ -49,12 +49,17 @@ def _clean_config(payload: dict) -> tuple[str, dict]:
     if not isinstance(agents, list):
         raise ValueError("agents 必须是数组")
     cleaned_agents = []
+    agent_ids = set()
     for i, a in enumerate(agents):
         if not isinstance(a, dict):
             raise ValueError("每个角色必须是对象")
+        agent_id = a.get("id") or f"a{i}"
+        if not isinstance(agent_id, str) or agent_id in agent_ids:
+            raise ValueError("角色 id 必须是互不重复的字符串")
+        agent_ids.add(agent_id)
         cleaned_agents.append(
             {
-                "id": a.get("id") or f"a{i}",
+                "id": agent_id,
                 "name": (a.get("name") or f"角色{i + 1}").strip(),
                 "system_prompt": a.get("system_prompt") or "",
                 "visibility": a.get("visibility") or [],
