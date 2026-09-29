@@ -165,9 +165,17 @@ class CancellableRuntime(FakeRuntime):
     def run(self, prompt, *, session_id, on_notification):
         from pathlib import Path
         path = Path(self.options["env"]["KDS_CONTROL_FILE"])
+        self.running = True
         deadline = time.monotonic() + 3
         while not self.closed and time.monotonic() < deadline:
-            if json.loads(path.read_text(encoding="utf-8")).get("cancel"):
+            try:
+                cancelled = json.loads(path.read_text(encoding="utf-8")).get("cancel")
+            except PermissionError:
+                # Python's Windows reader can race atomic replacement. Keep
+                # this test double polling instead of simulating an SDK crash.
+                time.sleep(0.01)
+                continue
+            if cancelled:
                 self.emit(on_notification, session_id, 1, "assistant/message", {
                     "usage": {"inputTokens": 10, "outputTokens": 2}, "interrupted": True,
                 })
@@ -178,11 +186,12 @@ class CancellableRuntime(FakeRuntime):
 
 @pytest.mark.parametrize("reason", ["manual", "limit", "timeout"])
 def test_cancellation_accounts_partial_usage_without_publishing(tmp_path, reason):
-    manager, _ = make_manager(tmp_path, factory=CancellableRuntime, timeout=0.15 if reason == "timeout" else 2)
+    manager, runtimes = make_manager(tmp_path, factory=CancellableRuntime, timeout=0.15 if reason == "timeout" else 2)
     started = time.monotonic()
     usage = []
     with pytest.raises(HarnessTurnError) as error:
-        invoke(manager, should_stop=lambda: reason if reason != "timeout" and time.monotonic() - started > 0.1 else None,
+        invoke(manager, should_stop=lambda: reason if reason != "timeout" and any(
+                   getattr(runtime, "running", False) for runtime in runtimes) else None,
                on_usage=usage.append)
     assert error.value.reason == reason
     assert sum(u["completion_tokens"] for u in usage) == 2
@@ -216,6 +225,37 @@ def test_failed_cancel_file_write_closes_runtime(tmp_path, monkeypatch):
     assert error.value.reason == "timeout"
     assert runtimes[0].closed
     manager.close()
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_cancel_file_replacement_handles_windows_read_contention(tmp_path, monkeypatch, persistent):
+    from pathlib import Path
+    from app.harness import _write_json
+
+    path = tmp_path / "control.json"
+    path.write_text('{"cancel":null}', encoding="utf-8")
+    original_replace = Path.replace
+    failures = []
+
+    def reader_holds_file(self, target):
+        if self == path.with_suffix(".tmp") and (persistent or len(failures) < 2):
+            failures.append(True)
+            error = PermissionError("Windows reader holds the old file")
+            error.winerror = 5
+            raise error
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", reader_holds_file)
+    started = time.monotonic()
+    if persistent:
+        with pytest.raises(PermissionError):
+            _write_json(path, {"cancel": "manual"})
+        assert json.loads(path.read_text(encoding="utf-8")) == {"cancel": None}
+    else:
+        _write_json(path, {"cancel": "manual"})
+        assert json.loads(path.read_text(encoding="utf-8")) == {"cancel": "manual"}
+        assert not path.with_suffix(".tmp").exists()
+    assert time.monotonic() - started < 1
 
 
 def test_runner_whiteboard_usage_checkpoint_and_restart(tmp_path):

@@ -65,7 +65,16 @@ def _write_json(path: Path, value: dict | list):
     # Atomic replacement keeps the runtime from reading half a cancellation file.
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
-    temporary.replace(path)
+    for attempt in range(6):
+        try:
+            temporary.replace(path)
+            return
+        except PermissionError as exc:
+            # Windows can briefly deny replacement while the runtime reads the
+            # old file. Give it a bounded chance to close before forced shutdown.
+            if getattr(exc, "winerror", None) not in {5, 32, 33} or attempt == 5:
+                raise
+            time.sleep(0.01)
 
 
 def event_usage(event: dict) -> dict:
