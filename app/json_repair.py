@@ -21,8 +21,6 @@ def request_json_repair(*, api_key, base_url, model, messages, max_tokens,
                         deadline, should_stop, client_factory=None):
     """No SDK retries or non-JSON fallback; caller owns attempts and accounting."""
     async def request():
-        from openai import AsyncOpenAI
-
         def check_stop():
             reason = should_stop()
             if reason:
@@ -31,7 +29,11 @@ def request_json_repair(*, api_key, base_url, model, messages, max_tokens,
                 raise RepairCancelled("timeout")
 
         check_stop()
-        factory = client_factory or AsyncOpenAI
+        factory = client_factory
+        if factory is None:
+            from openai import AsyncOpenAI
+            factory = AsyncOpenAI
+            check_stop()
         async with factory(api_key=api_key, base_url=base_url, max_retries=0,
                            timeout=max(0.1, deadline - time.monotonic())) as client:
             task = asyncio.create_task(client.chat.completions.create(
