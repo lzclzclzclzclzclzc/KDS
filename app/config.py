@@ -41,3 +41,22 @@ PORT = _int("PORT", 5000)
 
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "kds.db"
+
+# Discussion turns use Harness; auxiliary scoring/voting keep the LLM_* route.
+AGENT_BACKEND = os.getenv("AGENT_BACKEND", "dsh").strip().lower()
+DSH_MODEL = os.getenv("DSH_MODEL", "deepseek-v4-flash").strip()
+DSH_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
+# Newer standalone dsh uses Messages (/anthropic); the pinned SDK runtime
+# and auxiliary OpenAI client use Chat Completions. Keep their bases separate.
+DSH_BASE_URL = (os.getenv("DSH_BASE_URL", "").strip()
+                or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip()).rstrip("/")
+DSH_BIN = os.getenv("DSH_BIN", "").strip() or None
+DSH_REASONING_EFFORT = os.getenv("DSH_REASONING_EFFORT", "").strip() or None
+DSH_REQUEST_MAX_TOKENS = _int("DSH_REQUEST_MAX_TOKENS", 8192)
+DSH_TURN_MAX_TOKENS = _int("DSH_TURN_MAX_TOKENS", 24000)
+DSH_MAX_STEPS = _int("DSH_MAX_STEPS", 8)
+DSH_MAX_TOOL_CALLS = _int("DSH_MAX_TOOL_CALLS", 12)
+DSH_TURN_TIMEOUT = _float("DSH_TURN_TIMEOUT", 180)
+DSH_TOOLS = tuple(x.strip() for x in os.getenv(
+    "DSH_TOOLS", "web_search,web_fetch,read,glob,grep,write,edit,pwsh,bash"
+).split(",") if x.strip())

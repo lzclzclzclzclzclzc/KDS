@@ -5,8 +5,9 @@ import traceback
 from datetime import datetime, timezone
 from typing import Optional
 
-from app.config import DEFAULT_SINGLE_MAX_TOKENS
+from app.config import AGENT_BACKEND, DEFAULT_SINGLE_MAX_TOKENS
 from app.db import update_conversation
+from app.harness import HarnessManager, HarnessTurnError
 from app.llm import LLMClient
 from app.scheduler import update_heat, willingness_select
 
@@ -51,6 +52,14 @@ class ConversationRunner:
         self.config_id = config_id
         self.name = name
         self.llm = llm
+        self.agent_backend = config.get("agent_backend", AGENT_BACKEND)
+        if self.agent_backend not in {"dsh", "direct"}:
+            raise ValueError("AGENT_BACKEND 必须是 dsh 或 direct")
+        self.harness_state: dict[str, dict] = {}
+        self.harness_activity: Optional[dict] = None
+        self.harness = (
+            HarnessManager(conv_id) if self.agent_backend == "dsh" and not llm.mock else None
+        )
 
         self.single_max_tokens = int(config.get("single_max_tokens") or _derive_single_max_tokens(config))
         self.agents = _normalize_agents(config.get("agents", []), self.single_max_tokens)
@@ -183,6 +192,7 @@ class ConversationRunner:
             self.status = "running"
             self._interrupt_requested = False
             self._segment_start = time.time()
+            self.error = None
         self._thread = threading.Thread(target=self._run, name=f"conv-{self.id}", daemon=True)
         self._thread.start()
         return True
@@ -271,6 +281,9 @@ class ConversationRunner:
                 "config_id": self.config_id,
                 "name": self.name,
                 "status": self.status,
+                "agent_backend": self.agent_backend,
+                "harness_activity": dict(self.harness_activity) if self.harness_activity else None,
+                "harness_state": {k: dict(v) for k, v in self.harness_state.items()},
                 "started_at": self.started_at,
                 "ended_at": self.ended_at,
                 "agents": [{"id": a["id"], "name": a["name"]} for a in self.agents],
@@ -296,6 +309,7 @@ class ConversationRunner:
                     "last_editor": self.whiteboard_last_editor,
                 },
                 "config": {
+                    "agent_backend": self.agent_backend,
                     "agents": [dict(a) for a in self.agents],
                     "shared_background": self.shared_background,
                     "single_max_tokens": self.single_max_tokens,
@@ -338,9 +352,12 @@ class ConversationRunner:
 
     @classmethod
     def from_payload(cls, conv: dict, llm: LLMClient) -> "ConversationRunner":
-        config = conv.get("config") or {}
+        config = dict(conv.get("config") or {})
+        # Existing persisted discussions keep their original direct-call route.
+        config.setdefault("agent_backend", "direct")
         runner = cls(conv["id"], conv.get("config_id"), conv.get("name", "对话"), config, llm)
         runner.messages = [dict(m) for m in conv.get("messages", [])]
+        runner.harness_state = {k: dict(v) for k, v in (conv.get("harness_state") or {}).items()}
         heat = conv.get("heat")
         if heat and len(heat) == len(runner.agents):
             runner.heat = [float(h) for h in heat]
@@ -437,9 +454,17 @@ class ConversationRunner:
                 '{"op":"prepend","content":"加到白板开头的内容"}'
             )
         base += (
-            "\n\n请只输出一个 JSON 对象，不要输出任何多余文字，包含以下字段：\n"
+            "\n\n最终交付请只输出一个 JSON 对象，不要输出任何多余文字，包含以下字段：\n"
             + "\n".join(f"- {f}" for f in fields)
         )
+        if self.harness is not None:
+            base += (
+                "\n\n在最终交付前，你可以按需使用已启用的工具查资料、读取文件或计算。"
+                "不要为了使用工具而使用工具；引用外部资料时在 speech 中给出来源。"
+                "上面的 JSON 约束仅针对最终交付，工具调用走工具协议。"
+                "仅完成当前角色的本轮任务，发言调度、投票和共享白板由 KDS 管理。"
+                "白板只能通过最终 JSON 修改，工具产物保存在自己的工作目录。"
+            )
         if can_wb:
             fmt = "HTML" if self.whiteboard_format == "html" else "Markdown"
             current = self.whiteboard_content or "（当前白板为空）"
@@ -552,11 +577,36 @@ class ConversationRunner:
 
     # ---- Main loop ----
 
+    def _harness_stop_reason(self) -> Optional[str]:
+        with self._lock:
+            if self._interrupt_requested:
+                return "manual"
+            if self.total_duration_seconds is not None and self._elapsed_nolock() >= self.total_duration_seconds:
+                return "limit"
+        return None
+
+    def _harness_progress(self, activity: dict) -> None:
+        activity = dict(activity)
+        state = activity.pop("state", None)
+        with self._lock:
+            if state is not None:
+                self.harness_state[activity["agent_id"]] = dict(state)
+            self.harness_activity = activity
+        if state is not None:
+            self._persist()
+
+    def _harness_usage(self, usage: dict) -> None:
+        with self._lock:
+            self.total_output_tokens += usage["completion_tokens"]
+            self.total_prompt_tokens += usage["prompt_tokens"]
+        self._persist()
+
     def _run(self) -> None:
         with self._lock:
             if self._segment_start is None:
                 self._segment_start = time.time()
         end_voted = False
+        active_idx = None
         try:
             while True:
                 with self._lock:
@@ -604,10 +654,25 @@ class ConversationRunner:
                         idx, scores = self._willingness_choose()
 
                 agent = self.agents[idx]
+                active_idx = idx
                 system = self._build_system(agent)
                 max_tokens = self.single_max_tokens
                 system += f"\n\n（其中 speech 字段请控制在约 {max_tokens} tokens 以内。）"
-                turn_out, usage = self.llm.agent_turn(agent["name"], system, self._history(), max_tokens)
+                next_harness_state = None
+                if self.harness is not None:
+                    with self._lock:
+                        remaining_output = (None if self.total_max_tokens is None else
+                                            self.total_max_tokens - self.total_output_tokens)
+                        state = dict(self.harness_state.get(agent["id"], {}))
+                    turn_out, usage, next_harness_state = self.harness.run_turn(
+                        agent=agent, system=system, history=self._history(), state=state,
+                        remaining_output=remaining_output, should_stop=self._harness_stop_reason,
+                        on_progress=self._harness_progress, on_usage=self._harness_usage,
+                    )
+                    if reason := self._harness_stop_reason():
+                        raise HarnessTurnError("本轮工具执行已停止。", reason)
+                else:
+                    turn_out, usage = self.llm.agent_turn(agent["name"], system, self._history(), max_tokens)
 
                 speech = turn_out.get("speech") or ""
                 proposed_end = bool(turn_out.get("propose_end")) and self._is_proposer(agent)
@@ -630,11 +695,16 @@ class ConversationRunner:
                         "agent", agent["name"], speech, usage["completion_tokens"],
                         scores=scores, proposed_end=proposed_end, wb_edited=wb_edited,
                     )
-                    self.total_output_tokens += usage["completion_tokens"]
-                    self.total_prompt_tokens += usage["prompt_tokens"]
+                    if self.harness is None:
+                        self.total_output_tokens += usage["completion_tokens"]
+                        self.total_prompt_tokens += usage["prompt_tokens"]
+                    if next_harness_state is not None:
+                        self.harness_state[agent["id"]] = next_harness_state
+                    self.harness_activity = None
                     self.heat = update_heat(self.heat, idx, self.gamma)
                     self.last_agent_idx = idx
                     self.turn += 1
+                    active_idx = None
                 self._persist()
 
                 with self._lock:
@@ -659,6 +729,18 @@ class ConversationRunner:
                     self.paused_reason = "limit"
                 self._interrupt_requested = False
             self._persist()
+        except HarnessTurnError as exc:
+            self._pause_segment()
+            with self._lock:
+                self.status = "paused"
+                self.paused_reason = (
+                    "manual" if self._interrupt_requested or exc.reason == "manual" else
+                    "limit" if exc.reason == "limit" or self._limit_reached_nolock() else "error"
+                )
+                self.error = str(exc) if self.paused_reason == "error" else None
+                self._interrupt_requested = False
+                self._forced_next_idx = active_idx
+            self._persist()
         except Exception as exc:  # pragma: no cover - defensive
             # Pause recoverably instead of terminally erroring, so a transient
             # LLM failure doesn't kill the whole conversation. resume() only
@@ -670,6 +752,12 @@ class ConversationRunner:
                 self.status = "paused"
                 self.paused_reason = "error"
                 self._interrupt_requested = False
+            self._persist()
+        finally:
+            if self.harness is not None:
+                self.harness.close()
+            with self._lock:
+                self.harness_activity = None
             self._persist()
 
     def _finish(self, status: str, reason: Optional[str] = None) -> None:

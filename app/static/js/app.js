@@ -1112,6 +1112,7 @@
         summary: conv.summary || "",
         er: conv.ended_reason || "",
         pr: conv.paused_reason || "",
+        ha: conv.harness_activity || null,
         cr: !!conv.can_resume,
         v: conv.votes || [],
         wb: conv.whiteboard ? (conv.whiteboard.enabled ? 1 : 0) + ":" + (conv.whiteboard.rev || 0) : "",
@@ -1413,7 +1414,11 @@
         </div>
       `;
     } else if (conv.status === "running") {
-      html += `<div class="msg system"><div class="bubble"><span class="spinner" style="border-color:rgba(0,0,0,.15);border-top-color:#4f6ef7"></span> 正在思考…</div></div>`;
+      const activity = conv.harness_activity;
+      const progress = activity
+        ? `${activity.agent_name} · ${activity.stage}（分析 ${activity.steps || 0} 次，工具 ${activity.tool_calls || 0} 次）`
+        : "正在思考…";
+      html += `<div class="msg system"><div class="bubble"><span class="spinner" style="border-color:rgba(0,0,0,.15);border-top-color:#4f6ef7"></span> ${escapeHtml(progress)}</div></div>`;
     }
 
     return html;
