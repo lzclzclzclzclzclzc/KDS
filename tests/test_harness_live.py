@@ -8,6 +8,7 @@ import json
 import os
 import uuid
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -82,3 +83,33 @@ def test_live_auxiliary_json_call():
     assert content, "辅助 API 没有返回正文；检查推理输出是否耗尽 token 上限"
     assert json.loads(content) == {"score": 42}
     print(json.dumps({"live_auxiliary": "passed", "usage": usage}, ensure_ascii=False))
+
+
+def test_live_json_mode_repair_after_injected_format_error(tmp_path):
+    # Controlled format fault, then a REAL JSON-mode API call. No tool replay.
+    class InvalidFinalRuntime:
+        def __init__(self, **_options):
+            self.calls = 0
+        def run(self, *_args, **_kwargs):
+            self.calls += 1
+            return SimpleNamespace(finish_reason="completed", events=[],
+                final_response='{"speech":"格式修正测试：答案是42。","propose_end":false,}')
+        def close(self):
+            pass
+
+    settings = replace(HarnessSettings(), root=tmp_path, request_max_tokens=512,
+                       repair_max_tokens=512, turn_max_tokens=1024, timeout=45)
+    manager = HarnessManager("live-repair", settings, factory=InvalidFinalRuntime)
+    usage, progress = [], []
+    try:
+        turn, totals, state = manager.run_turn(agent={"id": "a0", "name": "测试"},
+            system="格式测试", history=[], state={}, remaining_output=1024,
+            should_stop=lambda: None, on_usage=usage.append, on_progress=progress.append)
+        assert "42" in turn["speech"]
+        assert not turn["propose_end"] and turn["whiteboard_ops"] == []
+        assert progress[-1]["format_repairs"] >= 1 and state["pending"] is False
+        assert totals["completion_tokens"] == sum(u["completion_tokens"] for u in usage) > 0
+        assert manager._runtimes["a0"].calls == 1
+        print(json.dumps({"live_json_repair": "passed", "usage": totals}, ensure_ascii=False))
+    finally:
+        manager.close()

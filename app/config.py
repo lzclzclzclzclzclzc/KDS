@@ -57,6 +57,10 @@ DSH_TURN_MAX_TOKENS = _int("DSH_TURN_MAX_TOKENS", 24000)
 DSH_MAX_STEPS = _int("DSH_MAX_STEPS", 8)
 DSH_MAX_TOOL_CALLS = _int("DSH_MAX_TOOL_CALLS", 12)
 DSH_TURN_TIMEOUT = _float("DSH_TURN_TIMEOUT", 180)
+DSH_JSON_BASE_URL = (os.getenv("DSH_JSON_BASE_URL", "").strip()
+                     or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip()).rstrip("/")
+DSH_JSON_REPAIR_ATTEMPTS = _int("DSH_JSON_REPAIR_ATTEMPTS", 2)
+DSH_JSON_REPAIR_MAX_TOKENS = _int("DSH_JSON_REPAIR_MAX_TOKENS", 8192)
 DSH_TOOLS = tuple(x.strip() for x in os.getenv(
     "DSH_TOOLS", "web_search,web_fetch,read,glob,grep,write,edit,pwsh,bash"
 ).split(",") if x.strip())

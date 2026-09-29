@@ -53,7 +53,7 @@
 
 ## DeepSeek Harness 讨论角色
 
-所有讨论角色通过官方 Python SDK 调用 dsh；发言意愿评分、投票、配置助手和最终总结仍使用 `LLM_*` 配置，可继续用本地 Qwen，也可以另外切到 DeepSeek。
+所有讨论角色通过官方 Python SDK 调用 dsh；发言意愿评分、投票、配置助手和最终总结通过 `LLM_*` 配置直连 DeepSeek。示例配置统一使用 DeepSeek API。
 
 ### 安装与配置
 
@@ -104,15 +104,30 @@ DSH_BASE_URL=https://api.deepseek.com/anthropic
 | --- | --- | --- |
 | `DSH_REQUEST_MAX_TOKENS` | 8192 | 单次讨论模型请求输出上限 |
 | `DSH_TURN_MAX_TOKENS` | 24000 | 一个工具回合的输出预算 |
-| `DSH_MAX_STEPS` | 8 | 本轮最多模型步骤 |
+| `DSH_MAX_STEPS` | 8 | 本轮最多模型步骤，包含格式修正请求 |
 | `DSH_MAX_TOOL_CALLS` | 12 | 本轮最多工具执行次数 |
 | `DSH_TURN_TIMEOUT` | 180 | 本轮最长秒数，包含启动时间 |
 | `DSH_REASONING_EFFORT` | 空 | 可选的模型推理档位；空值沿用模型默认 |
 | `DSH_TOOLS` | 见上文 | 允许使用的工具名，以逗号分隔 |
+| `DSH_JSON_BASE_URL` | `DEEPSEEK_BASE_URL` | 格式修正使用的 Chat Completions 地址，不能带 `/anthropic` |
+| `DSH_JSON_REPAIR_ATTEMPTS` | 2 | 格式失败后最多修正次数；可设 0 关闭，最大为 2 |
+| `DSH_JSON_REPAIR_MAX_TOKENS` | 8192 | 每次格式修正的输出上限，还受请求上限与剩余预算约束 |
 
-配置页的单次发言 token 数仍用于指导 `speech` 的长度，与工具循环预算独立。群聊总输出累计 SDK 已上报的每步输出（包括已上报的失败尝试和压缩总结），不再只统计最终发言。输入统计包含缓存输入，推理 token 不重复计数。服务商未上报的消耗无法精确补算；上下文压缩由 dsh 独立执行，可能使总预算在结算时超过阈值。预算不是精确的人民币费用限制。
+配置页的单次发言 token 数仍用于指导 `speech` 的长度，与工具循环预算独立。群聊总输出累计 SDK 已上报的每步输出（包括已上报的失败尝试和压缩总结）及 JSON 修正请求的输出，不再只统计最终发言。输入统计包含缓存输入，推理 token 不重复计数。服务商未上报的消耗（例如请求取消前没有返回用量）无法精确补算；上下文压缩由 dsh 独立执行，可能使总预算在结算时超过阈值。预算不是精确的人民币费用限制。
 
 暂停按钮会取消活动 Agent，允许正在执行的工具收尾；如果运行时未响应，3 秒后进入进程关闭兜底。总时长到达也会中断活动回合。回合自身的步骤、工具次数、时间或输出预算到达会暂停并提示，可以调整 `.env`、重启服务后继续。总输出/总时长到达则按原流程先延长上限。只有人类点击「总结并完成」才会完成讨论。
+
+### JSON 格式修正
+
+最终回复先在本地解析、校验。允许外层 Markdown 代码围栏，字符串里的代码块、括号和转义字符会完整保留；重复字段、多份 JSON 混合或不合法的白板操作会判为格式错误。
+
+只有非空、且服务商未报告截断的回复发生格式错误时，才用同一 `DEEPSEEK_API_KEY` 与 `DSH_MODEL` 额外请求 DeepSeek Chat Completions，启用 `response_format={"type":"json_object"}`，关闭推理和工具。此请求只接收原始最终回复、校验错误及上次修正结果，不重跑 DSH 的调查或工具。页面显示「修正输出格式」。有效回复不会增加这次 API 调用。
+
+已通过校验的原发言、白板操作由本地代码保留；已有但畸形的白板结构可交给修正模型处理。无法解析原 JSON 或原回复未包含白板时，修正结果不能新增白板操作；结束提议仅保留原 JSON 明确给出的 `true`。引擎仍检查角色的白板编辑和结束提议权限。
+
+JSON mode 约束语法，修正结果仍须通过本地字段校验。修正最多两次，共享本轮剩余步骤、时间、token 及讨论总预算；成功立即结束，失败尝试的已报告用量也会累计。请求失败、预算耗尽、空原回复、已知截断或连续校验失败仍会暂停，未通过校验的发言和白板操作不会发布。设置 `DSH_JSON_REPAIR_ATTEMPTS=0` 可关闭修正；不添加新环境变量时默认开启。修改代码或配置后需重启服务。
+
+接口依据：[DeepSeek JSON Output](https://api-docs.deepseek.com/guides/json_mode/)。
 
 ### 验证
 
@@ -123,7 +138,7 @@ node tests/test_frontend_timers.js
 node tests/test_dsh_bridge.mjs
 ```
 
-真实 SDK 集成测试连接本地模拟 API，不使用真实密钥、不消耗 DeepSeek 额度，验证文件工具执行、双花括号提示词、用量、预算、取消和跨进程恢复：
+真实 SDK 集成测试连接本地模拟 API，不使用真实密钥、不消耗 DeepSeek 额度，验证文件工具执行、双花括号提示词、格式修正、用量、预算、取消和跨进程恢复：
 
 ```powershell
 $env:KDS_TEST_DSH_RUNTIME = "1"
@@ -133,7 +148,7 @@ $env:KDS_TEST_DSH_BIN = "C:/完整路径/dsh.cmd"
 .\.venv\Scripts\python.exe -m pytest tests/test_harness_integration.py -q
 ```
 
-填好 `.env` 后，也可显式启用**会消耗 DeepSeek 额度**的真实 API 测试。它使用临时工作目录，验证两个角色分别读取真实文件、发言、更新白板，以及辅助 JSON 调用；不修改已有讨论：
+填好 `.env` 后，也可显式启用**会消耗 DeepSeek 额度**的真实 API 测试。它使用临时工作目录，验证两个角色分别读取真实文件、发言、更新白板，以及辅助 JSON 调用和故意注入格式错误后的 JSON mode 修正；不修改已有讨论：
 
 ```powershell
 $env:KDS_TEST_DEEPSEEK_LIVE = "1"
@@ -154,6 +169,7 @@ KDS/
 │  ├─ db.py             # SQLite 持久化
 │  ├─ llm.py            # OpenAI 兼容客户端（含 mock）
 │  ├─ harness.py        # 官方 dsh Python SDK、角色会话和恢复检查点
+│  ├─ json_repair.py    # 可取消的 DeepSeek JSON mode 格式修正请求
 │  ├─ dsh/bridge.mjs    # dsh 提示词、工具限制、回合预算与取消
 │  ├─ scheduler.py      # 发言调度算法
 │  ├─ engine.py         # 对话引擎

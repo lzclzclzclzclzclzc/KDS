@@ -19,7 +19,7 @@ pytestmark = pytest.mark.skipif(os.getenv("KDS_TEST_DSH_RUNTIME") != "1",
                                 reason="需要显式启用本机 dsh 运行时集成验证")
 
 
-@pytest.mark.parametrize("mode", ["normal", "steps", "tools", "budget", "cancel"])
+@pytest.mark.parametrize("mode", ["normal", "repair", "steps", "tools", "budget", "cancel"])
 def test_real_sdk_tool_loop_and_durable_resume(tmp_path, mode):
     requests = []
 
@@ -42,13 +42,29 @@ def test_real_sdk_tool_loop_and_durable_resume(tmp_path, mode):
                 self.end_headers()
                 return
             requests.append(body)
+            if body.get("response_format"):
+                assert self.path == "/v1/chat/completions"
+                assert body["response_format"] == {"type": "json_object"}
+                assert body["thinking"] == {"type": "disabled"}
+                assert "tools" not in body
+                result = {"id": "repair", "object": "chat.completion", "created": 1,
+                    "model": body["model"], "choices": [{"index": 0, "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": '{"speech":"资料显示答案是42。"}'}}],
+                    "usage": {"prompt_tokens": 30, "completion_tokens": 10, "total_tokens": 40}}
+                encoded = json.dumps(result).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+                return
             if mode == "cancel":
                 time.sleep(1)
             messages = body["messages"]
             last = messages[-1]
             last_blocks = last.get("content") if isinstance(last.get("content"), list) else []
             if last["role"] == "tool" or any(b.get("type") == "tool_result" for b in last_blocks):
-                delta = {"content": json.dumps({"speech": "资料显示答案是42。",
+                delta = {"content": json.dumps({"content" if mode == "repair" else "speech": "资料显示答案是42。",
                     "whiteboard": {"ops": [{"op": "append", "content": "答案：42"}]}}, ensure_ascii=False)}
                 finish = "stop"
             else:
@@ -101,6 +117,7 @@ def test_real_sdk_tool_loop_and_durable_resume(tmp_path, mode):
     settings = HarnessSettings(root=tmp_path, api_key="local-test-key",
         base_url=f"http://127.0.0.1:{server.server_port}" + (
             "/anthropic" if os.getenv("KDS_TEST_DSH_BIN") else "/v1"),
+        json_base_url=f"http://127.0.0.1:{server.server_port}/v1",
         dsh_bin=os.getenv("KDS_TEST_DSH_BIN") or None, tools=("read",), timeout=45,
         max_steps=1 if mode == "steps" else 8, max_tool_calls=1 if mode == "tools" else 12)
     manager = HarnessManager("integration", settings)
@@ -115,7 +132,7 @@ def test_real_sdk_tool_loop_and_durable_resume(tmp_path, mode):
         should_stop=lambda: "manual" if mode == "cancel" and requests else None,
         on_progress=progress.append, on_usage=usage.append)
     try:
-        if mode != "normal":
+        if mode not in {"normal", "repair"}:
             with pytest.raises(HarnessTurnError) as error:
                 manager.run_turn(**args)
             assert error.value.reason == {"steps": "steps", "tools": "tools", "budget": "limit", "cancel": "manual"}[mode]
@@ -125,6 +142,14 @@ def test_real_sdk_tool_loop_and_durable_resume(tmp_path, mode):
             return
         turn, totals, state = manager.run_turn(**args)
         assert turn["whiteboard_ops"][0]["content"] == "答案：42"
+        if mode == "repair":
+            assert totals["completion_tokens"] == 30
+            assert totals["prompt_tokens"] == 90
+            assert len(requests) == 3
+            assert len([r for r in requests if "response_format" in r]) == 1
+            assert progress[-1]["format_repairs"] == 1
+            assert state["pending"] is False
+            return
         assert totals["completion_tokens"] == 20
         assert totals["prompt_tokens"] == 60
         assert len(requests) == 2
