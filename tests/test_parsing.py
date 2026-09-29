@@ -1,4 +1,9 @@
-from app.llm import _extract_json, _parse_score, _parse_vote
+import json
+
+import pytest
+
+from app.harness import FinalFormatError, parse_final
+from app.llm import _extract_json, _parse_score, _parse_turn, _parse_vote
 
 
 # ---- _parse_score ----
@@ -60,6 +65,51 @@ def test_extract_json_invalid_returns_none():
 def test_extract_json_empty_returns_none():
     assert _extract_json("") is None
     assert _extract_json(None) is None
+
+
+@pytest.mark.parametrize("wrapper", ["{}", "```json\n{}\n```", "```JSON\r\n{}\r\n```",
+                                    "说明：\n```json\n{}\n```\n以上是结果。", "\ufeff{}"])
+@pytest.mark.parametrize("content", [
+    '# 方案\n```python\nprint({"nested": "value"})\n```\n后文不能丢失',
+    r'字面量 \n 与 \\、"引号"、花括号 { }、数组 [ ] 和 ``` 都须保留',
+    '中文 🐱\t\r\n<script>const x = {a: "}"};</script>',
+])
+def test_json_strings_survive_markdown_and_escaping(wrapper, content):
+    data = {"speech": "发言内也可以有 ``` 和 {括号}", "propose_end": False,
+            "whiteboard": {"ops": [{"op": "append", "content": content}]}}
+    text = wrapper.format(json.dumps(data, ensure_ascii=False))
+    assert _extract_json(text) == data
+    # Both direct and Harness parsers must preserve the same exact strings.
+    for parser in (_parse_turn, parse_final):
+        turn = parser(text)
+        assert turn["speech"] == data["speech"]
+        assert turn["whiteboard_ops"] == data["whiteboard"]["ops"]
+
+
+@pytest.mark.parametrize("text", [
+    '{"speech":"first"} {"speech":"second"}',
+    '```json\n{"speech":"first"}\n```\n```json\n{"speech":"second"}\n```',
+    '{"outer":{"speech":"nested must not be salvaged"}',
+    '{"speech":"first","speech":"ambiguous"}',
+    '{"speech":"x","whiteboard":{"ops":[],"ops":[]}}',
+    '{"speech":"x","score":NaN}', '{"speech":"x","score":Infinity}',
+    '{"speech":"x","score":1e999}', '{"speech":"x"}}', '{"speech":"x"}]',
+    '{"speech":"unterminated', '{"speech":"literal\ncontrol character"}',
+    [], 42,
+])
+def test_invalid_or_ambiguous_json_is_not_silently_salvaged(text):
+    assert _extract_json(text) is None
+
+
+@pytest.mark.parametrize("op", [[], {}, None, False, 12])
+def test_malformed_whiteboard_op_is_format_error_not_type_error(op):
+    with pytest.raises(FinalFormatError):
+        parse_final(json.dumps({"speech": "x", "whiteboard": {"ops": [{"op": op}]}}))
+
+
+def test_empty_replace_target_is_not_silently_accepted():
+    with pytest.raises(FinalFormatError):
+        parse_final('{"speech":"x","whiteboard":{"ops":[{"op":"replace","find":"","replace":"x"}]}}')
 
 
 # ---- _parse_vote ----

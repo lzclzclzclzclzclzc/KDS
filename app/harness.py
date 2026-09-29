@@ -16,13 +16,17 @@ from pathlib import Path
 from typing import Callable
 
 from app import config
-from app.llm import _extract_json, _parse_turn
+from app.llm import _extract_json
 
 
 class HarnessTurnError(RuntimeError):
     def __init__(self, message: str, reason: str = "error"):
         super().__init__(message)
         self.reason = reason
+
+
+class FinalFormatError(HarnessTurnError):
+    """Only this failure class is eligible for JSON-mode repair."""
 
 
 @dataclass(frozen=True)
@@ -85,20 +89,24 @@ def event_usage(event: dict) -> dict:
 def parse_final(text: str) -> dict:
     data = _extract_json(text)
     if not isinstance(data, dict) or not isinstance(data.get("speech"), str) or not data["speech"].strip():
-        raise HarnessTurnError("工具回合没有交付有效的 speech JSON；已暂停，可继续重试。")
+        raise FinalFormatError("最终交付必须包含非空字符串 speech。")
     if "propose_end" in data and not isinstance(data["propose_end"], bool):
-        raise HarnessTurnError("工具回合的 propose_end 必须是布尔值。")
+        raise FinalFormatError("工具回合的 propose_end 必须是布尔值。")
     wb = data.get("whiteboard")
     if wb is not None:
         if not isinstance(wb, dict) or not isinstance(wb.get("ops"), list):
-            raise HarnessTurnError("工具回合的 whiteboard.ops 必须是数组。")
+            raise FinalFormatError("工具回合的 whiteboard.ops 必须是数组。")
         for op in wb["ops"]:
-            if not isinstance(op, dict) or op.get("op") not in {"append", "prepend", "replace", "set"}:
-                raise HarnessTurnError("工具回合包含无效的白板操作。")
+            if (not isinstance(op, dict) or not isinstance(op.get("op"), str)
+                    or op["op"] not in {"append", "prepend", "replace", "set"}):
+                raise FinalFormatError("工具回合包含无效的白板操作。")
             fields = ("find", "replace") if op["op"] == "replace" else ("content",)
             if any(not isinstance(op.get(k), str) for k in fields):
-                raise HarnessTurnError("白板操作的内容必须是字符串。")
-    return _parse_turn(json.dumps(data, ensure_ascii=False))
+                raise FinalFormatError("白板操作的内容必须是字符串。")
+            if op["op"] == "replace" and not op["find"]:
+                raise FinalFormatError("白板 replace 操作的 find 不能为空。")
+    return {"speech": data["speech"].strip(), "propose_end": data.get("propose_end", False),
+            "whiteboard_ops": wb["ops"] if wb else []}
 
 
 def tool_excerpt(message: dict) -> dict | None:
