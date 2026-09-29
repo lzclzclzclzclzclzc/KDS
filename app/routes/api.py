@@ -18,6 +18,7 @@ from app.db import (
 )
 from app.engine import RUNNERS, RUNNERS_LOCK, ConversationRunner
 from app.llm import LLMClient
+from app.tool_logs import tool_log_index
 
 api_bp = Blueprint("api", __name__)
 
@@ -272,11 +273,21 @@ def conversations_create():
 
 @api_bp.get("/api/conversations/<conv_id>")
 def conversations_get(conv_id):
+    include_logs = request.args.get("tool_logs") == "1"
     if conv_id in RUNNERS:
-        return jsonify(RUNNERS[conv_id].to_dict())
+        return jsonify(RUNNERS[conv_id].to_dict(include_tool_logs=include_logs))
     record = get_conversation(conv_id)
     if record is None:
         return _err("对话不存在", 404)
+    # No live runner owns these records after a server restart. The collapsed
+    # index and expanded bodies must agree on unfinished calls.
+    for item in record.get("harness_logs") or []:
+        if item.get("status") == "running":
+            item["status"] = "interrupted"
+            record["harness_log_rev"] = int(record.get("harness_log_rev") or 0) + 1
+    record["harness_log_index"] = tool_log_index(record.get("harness_logs") or [])
+    if not include_logs:
+        record.pop("harness_logs", None)
     return jsonify(record)
 
 

@@ -983,6 +983,7 @@
     chatSig = "";
     wbOpen = false;
     wbView = "render";
+    chatConv = null;
     app.innerHTML = `
       <div class="chat-shell">
         <div class="chat-header">
@@ -1019,6 +1020,11 @@
     app.querySelector("[data-back]").addEventListener("click", () => {
       location.hash = "#/";
     });
+    app.querySelector("#chat-messages").addEventListener("toggle", (event) => {
+      if (event.target.matches(".tool-log-group") && event.target.open && !chatConv?.harness_logs) {
+        pollChat();
+      }
+    }, true);
     app.querySelector("#chat-whiteboard-toggle").addEventListener("click", () => {
       wbOpen = !wbOpen;
       renderWhiteboard(chatConv);
@@ -1100,8 +1106,12 @@
     if (!chatConvId) return;
     const requestedId = chatConvId;
     try {
-      const conv = await api("/api/conversations/" + requestedId);
+      const includeLogs = app.querySelectorAll(".tool-log-group[open]").length > 0;
+      const conv = await api("/api/conversations/" + requestedId + (includeLogs ? "?tool_logs=1" : ""));
       if (requestedId !== chatConvId) return;
+      if (chatConv && !conv.harness_logs && chatConv.harness_log_rev === conv.harness_log_rev) {
+        conv.harness_logs = chatConv.harness_logs;
+      }
       chatConv = conv;
       updateCountdown(conv);
       updateTokenInfo(conv);
@@ -1113,6 +1123,9 @@
         er: conv.ended_reason || "",
         pr: conv.paused_reason || "",
         ha: conv.harness_activity || null,
+        logs: conv.harness_log_rev || 0,
+        logBodies: !!conv.harness_logs,
+        logDropped: conv.harness_log_dropped || 0,
         cr: !!conv.can_resume,
         v: conv.votes || [],
         wb: conv.whiteboard ? (conv.whiteboard.enabled ? 1 : 0) + ":" + (conv.whiteboard.rev || 0) : "",
@@ -1140,6 +1153,39 @@
     if (!tokenInfo) return;
     const maxTokens = conv.total_max_tokens != null ? conv.total_max_tokens : "∞";
     tokenInfo.textContent = `输出 ${conv.total_output_tokens || 0} / ${maxTokens} tokens`;
+  }
+
+  function renderToolLogsHTML(logs, expanded) {
+    const labels = { running: "执行中", completed: "成功", error: "失败", interrupted: "未完成" };
+    return logs.map((entry) => {
+      const status = Object.hasOwn(labels, entry.status) ? entry.status : "interrupted";
+      const when = entry.started_at || entry.finished_at;
+      const result = !entry.details_loaded ? "正在加载结果…" : entry.result != null ? entry.result : (status === "running" ? "等待工具返回…" : "本次调用未收到结果。");
+      const detailId = "call:" + entry.id;
+      return `<details class="tool-log-item" data-log-id="${escapeHtml(entry.id)}" data-detail-id="${escapeHtml(detailId)}" ${expanded.has(detailId) ? "open" : ""}>
+        <summary>
+          <span class="tool-log-arrow" aria-hidden="true">›</span>
+          <span class="tool-log-title"><strong>${escapeHtml(entry.tool || "工具结果")}</strong><span>${escapeHtml(entry.agent_name || "角色")} · 回合 ${escapeHtml(entry.turn || "—")}${entry.step != null ? ` · 步骤 ${escapeHtml(entry.step)}` : ""}</span></span>
+          <span class="tool-log-outcome"><span class="tool-log-status ${status}">${labels[status]}</span><time>${escapeHtml(when ? fmtTime(when) : "")}</time></span>
+        </summary>
+        <div class="tool-log-content"><h3>调用参数</h3><pre data-log-scroll="${escapeHtml(entry.id)}:args">${escapeHtml(!entry.details_loaded ? "正在加载参数…" : entry.arguments != null ? entry.arguments : "未记录参数")}</pre><h3>返回结果</h3><pre data-log-scroll="${escapeHtml(entry.id)}:result">${escapeHtml(result)}</pre></div>
+      </details>`;
+    }).join("");
+  }
+
+  function renderToolGroup(group, expanded) {
+    if (!group) return "";
+    const logs = group.logs;
+    const running = logs.filter((entry) => entry.status === "running").length;
+    const failed = logs.filter((entry) => entry.status === "error").length;
+    const interrupted = logs.filter((entry) => entry.status === "interrupted").length;
+    const status = running ? "running" : failed ? "error" : interrupted ? "interrupted" : "completed";
+    const label = running ? `${running} 执行中` : failed ? `${failed} 失败` : interrupted ? `${interrupted} 未完成` : "已完成";
+    const detailId = "group:" + group.key;
+    return `<details class="tool-log-group" data-detail-id="${escapeHtml(detailId)}" ${expanded.has(detailId) ? "open" : ""}>
+      <summary><span class="tool-log-arrow" aria-hidden="true">›</span><span>工具调用 · ${logs.length} 次</span><span class="tool-log-status ${status}">${label}</span></summary>
+      <div class="tool-log-calls">${renderToolLogsHTML(logs, expanded)}</div>
+    </details>`;
   }
 
   function renderChatState(conv) {
@@ -1196,8 +1242,17 @@
 
     const box = document.getElementById("chat-messages");
     const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 120;
-    box.innerHTML = renderMessagesHTML(conv);
-    if (nearBottom) box.scrollTop = box.scrollHeight;
+    const scrollTop = box.scrollTop;
+    const expanded = new Set(Array.from(box.querySelectorAll("details[open][data-detail-id]")).map((node) => node.dataset.detailId));
+    const focusId = box.contains(document.activeElement) ? document.activeElement.closest("[data-detail-id]")?.dataset.detailId : null;
+    const logScroll = new Map(Array.from(box.querySelectorAll("[data-log-scroll]")).map((node) => [node.dataset.logScroll, node.scrollTop]));
+    box.innerHTML = renderMessagesHTML(conv, expanded);
+    box.querySelectorAll("[data-log-scroll]").forEach((node) => { node.scrollTop = logScroll.get(node.dataset.logScroll) || 0; });
+    if (focusId) {
+      const item = Array.from(box.querySelectorAll("[data-detail-id]")).find((node) => node.dataset.detailId === focusId);
+      item?.querySelector("summary").focus({ preventScroll: true });
+    }
+    box.scrollTop = nearBottom ? box.scrollHeight : scrollTop;
 
     renderWhiteboard(conv);
   }
@@ -1328,7 +1383,7 @@
     return html;
   }
 
-  function renderMessagesHTML(conv) {
+  function renderMessagesHTML(conv, expanded = new Set()) {
     const avatars = {};
     (conv.agents || []).forEach((a, i) => {
       avatars[a.name] = { color: avatarColor(a.name), initial: a.name.slice(0, 1) };
@@ -1338,7 +1393,7 @@
       conv.scheduling_mode === "willingness" ? "按意愿调度" : "轮流发言"
     }</div></div>`;
 
-    const renderMessage = (m) => {
+    const renderMessage = (m, group, agentId, turn) => {
       if (m.role === "human") {
         return `
           <div class="msg human">
@@ -1368,11 +1423,12 @@
         ? '<div class="score-line">📝 更新了白板</div>'
         : "";
       return `
-        <div class="msg agent">
+        <div class="msg agent${group ? " has-tools" : ""}" data-agent-id="${escapeHtml(agentId)}" data-turn="${escapeHtml(turn)}">
           <div class="avatar" style="background:${escapeHtml(a.color)}">${escapeHtml(a.initial)}</div>
           <div class="msg-body">
             <div class="speaker">${escapeHtml(m.speaker)}</div>
             <div class="msg-time">${escapeHtml(fmtTime(m.ts))}</div>
+            ${renderToolGroup(group, expanded)}
             <div class="bubble">${escapeHtml(m.content)}</div>
             ${scoreLine}
             ${endTag}
@@ -1382,9 +1438,31 @@
       `;
     };
 
+    const groups = new Map();
+    const bodies = new Map((conv.harness_logs || []).map((entry) => [entry.id, entry]));
+    (conv.harness_log_index || conv.harness_logs || []).forEach((entry) => {
+      const key = JSON.stringify([entry.agent_id || entry.agent_name, Number(entry.turn)]);
+      if (!groups.has(key)) groups.set(key, { key, agentId: entry.agent_id || entry.agent_name, name: entry.agent_name || "角色", turn: entry.turn, logs: [] });
+      groups.get(key).logs.push({ ...entry, ...bodies.get(entry.id), details_loaded: bodies.has(entry.id) });
+    });
+    if (conv.harness_log_dropped) {
+      html += `<div class="tool-log-history-note">仅保留最近 200 条工具调用，较早 ${escapeHtml(conv.harness_log_dropped)} 条已省略。</div>`;
+    }
     const events = [];
-    (conv.messages || []).forEach((m) => {
-      events.push({ ts: m.ts || "", kind: "message", data: m });
+    const matched = new Set();
+    (conv.messages || []).forEach((m, index) => {
+      const agentId = m.agent_id || (conv.agents || []).find((agent) => agent.name === m.speaker)?.id || m.speaker;
+      const turn = Number(m.round ?? index) + 1;
+      const key = JSON.stringify([agentId, turn]);
+      const group = m.role === "agent" ? groups.get(key) : null;
+      if (group) matched.add(key);
+      events.push({ ts: m.ts || "", kind: "message", data: m, group, agentId, turn });
+    });
+    groups.forEach((group, key) => {
+      if (!matched.has(key)) {
+        const first = group.logs[0];
+        events.push({ ts: first.started_at || first.finished_at || "", kind: "tools", data: group });
+      }
     });
     (conv.votes || []).forEach((v) => {
       events.push({ ts: v.created_at || "", kind: "vote", data: v });
@@ -1392,9 +1470,15 @@
     events.sort((a, b) => String(a.ts || "").localeCompare(String(b.ts || "")));
     events.forEach((event) => {
       if (event.kind === "message") {
-        html += renderMessage(event.data);
-      } else {
+        html += renderMessage(event.data, event.group, event.agentId, event.turn);
+      } else if (event.kind === "vote") {
         html += voteBlockHTML(event.data);
+      } else {
+        const group = event.data;
+        html += `<div class="msg agent has-tools tool-turn" data-agent-id="${escapeHtml(group.agentId)}" data-turn="${escapeHtml(group.turn)}">
+          <div class="avatar" style="background:${escapeHtml(avatarColor(group.name))}">${escapeHtml(group.name.slice(0, 1))}</div>
+          <div class="msg-body"><div class="speaker">${escapeHtml(group.name)}</div><div class="msg-time">${escapeHtml(fmtTime(event.ts))}</div>${renderToolGroup(group, expanded)}</div>
+        </div>`;
       }
     });
 

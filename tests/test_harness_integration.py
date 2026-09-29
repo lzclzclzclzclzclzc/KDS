@@ -142,6 +142,11 @@ def test_real_sdk_tool_loop_and_durable_resume(tmp_path, mode):
             return
         turn, totals, state = manager.run_turn(**args)
         assert turn["whiteboard_ops"][0]["content"] == "答案：42"
+        logs = [entry["tool_log"] for entry in progress if "tool_log" in entry]
+        assert len(logs) == 2
+        assert logs[0]["id"] == logs[1]["id"]
+        assert logs[0]["tool"] == "read" and "evidence.txt" in logs[0]["arguments"]
+        assert logs[1]["status"] == "completed" and "verified-answer=42" in logs[1]["result"]
         if mode == "repair":
             assert totals["completion_tokens"] == 30
             assert totals["prompt_tokens"] == 90

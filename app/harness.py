@@ -18,6 +18,7 @@ from typing import Callable
 from app import config
 from app.json_repair import RepairCancelled, request_json_repair
 from app.llm import _extract_json
+from app.tool_logs import tool_log_update
 
 
 class HarnessTurnError(RuntimeError):
@@ -294,7 +295,12 @@ class HarnessManager:
                     research.append(excerpt)
                     research[:] = research[-8:]
             if event_type in {"step/start", "tool/call", "tool/result"}:
-                on_progress(dict(activity))
+                progress = dict(activity)
+                log = tool_log_update(event, control["run_id"],
+                                      (self.settings.api_key, config.LLM_API_KEY))
+                if log is not None:
+                    progress["tool_log"] = log
+                on_progress(progress)
 
         def watch():
             cancelled_at = None

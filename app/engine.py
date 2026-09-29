@@ -10,6 +10,7 @@ from app.db import update_conversation
 from app.harness import HarnessManager, HarnessTurnError
 from app.llm import LLMClient
 from app.scheduler import update_heat, willingness_select
+from app.tool_logs import MAX_TOOL_LOGS, tool_log_index
 
 
 def _now() -> str:
@@ -57,6 +58,9 @@ class ConversationRunner:
             raise ValueError("AGENT_BACKEND 必须是 dsh 或 direct")
         self.harness_state: dict[str, dict] = {}
         self.harness_activity: Optional[dict] = None
+        self.harness_logs: list[dict] = []
+        self.harness_log_rev = 0
+        self.harness_log_dropped = 0
         self.harness = (
             HarnessManager(conv_id) if self.agent_backend == "dsh" and not llm.mock else None
         )
@@ -267,7 +271,7 @@ class ConversationRunner:
         with self._lock:
             self._interrupt_requested = True
 
-    def to_dict(self) -> dict:
+    def to_dict(self, include_tool_logs: bool = True) -> dict:
         with self._lock:
             active_seconds = self._active_seconds
             if self._segment_start is not None:
@@ -283,6 +287,11 @@ class ConversationRunner:
                 "status": self.status,
                 "agent_backend": self.agent_backend,
                 "harness_activity": dict(self.harness_activity) if self.harness_activity else None,
+                "harness_log_count": len(self.harness_logs),
+                "harness_log_rev": self.harness_log_rev,
+                "harness_log_dropped": self.harness_log_dropped,
+                "harness_log_index": tool_log_index(self.harness_logs),
+                **({"harness_logs": [dict(item) for item in self.harness_logs]} if include_tool_logs else {}),
                 "harness_state": {k: dict(v) for k, v in self.harness_state.items()},
                 "started_at": self.started_at,
                 "ended_at": self.ended_at,
@@ -358,6 +367,10 @@ class ConversationRunner:
         runner = cls(conv["id"], conv.get("config_id"), conv.get("name", "对话"), config, llm)
         runner.messages = [dict(m) for m in conv.get("messages", [])]
         runner.harness_state = {k: dict(v) for k, v in (conv.get("harness_state") or {}).items()}
+        runner.harness_logs = [dict(item) for item in (conv.get("harness_logs") or [])[-MAX_TOOL_LOGS:]]
+        runner.harness_log_rev = int(conv.get("harness_log_rev") or 0)
+        runner.harness_log_dropped = int(conv.get("harness_log_dropped") or 0)
+        runner._finish_tool_logs_nolock()
         heat = conv.get("heat")
         if heat and len(heat) == len(runner.agents):
             runner.heat = [float(h) for h in heat]
@@ -588,12 +601,31 @@ class ConversationRunner:
     def _harness_progress(self, activity: dict) -> None:
         activity = dict(activity)
         state = activity.pop("state", None)
+        log = activity.pop("tool_log", None)
         with self._lock:
             if state is not None:
                 self.harness_state[activity["agent_id"]] = dict(state)
             self.harness_activity = activity
-        if state is not None:
+            if log is not None:
+                existing = next((item for item in self.harness_logs if item["id"] == log["id"]), None)
+                if existing is None:
+                    existing = {"id": log["id"], "agent_id": activity["agent_id"],
+                                "agent_name": activity["agent_name"], "turn": self.turn + 1}
+                    self.harness_logs.append(existing)
+                existing.update(log)
+                overflow = max(0, len(self.harness_logs) - MAX_TOOL_LOGS)
+                if overflow:
+                    del self.harness_logs[:overflow]
+                    self.harness_log_dropped += overflow
+                self.harness_log_rev += 1
+        if state is not None or log is not None:
             self._persist()
+
+    def _finish_tool_logs_nolock(self):
+        for item in self.harness_logs:
+            if item.get("status") == "running":
+                item["status"] = "interrupted"
+                self.harness_log_rev += 1
 
     def _harness_usage(self, usage: dict) -> None:
         with self._lock:
@@ -671,6 +703,8 @@ class ConversationRunner:
                     )
                     if reason := self._harness_stop_reason():
                         raise HarnessTurnError("本轮工具执行已停止。", reason)
+                    with self._lock:
+                        self._finish_tool_logs_nolock()
                 else:
                     turn_out, usage = self.llm.agent_turn(agent["name"], system, self._history(), max_tokens)
 
@@ -695,6 +729,7 @@ class ConversationRunner:
                         "agent", agent["name"], speech, usage["completion_tokens"],
                         scores=scores, proposed_end=proposed_end, wb_edited=wb_edited,
                     )
+                    self.messages[-1]["agent_id"] = agent["id"]
                     if self.harness is None:
                         self.total_output_tokens += usage["completion_tokens"]
                         self.total_prompt_tokens += usage["prompt_tokens"]
@@ -758,6 +793,7 @@ class ConversationRunner:
                 self.harness.close()
             with self._lock:
                 self.harness_activity = None
+                self._finish_tool_logs_nolock()
             self._persist()
 
     def _finish(self, status: str, reason: Optional[str] = None) -> None:

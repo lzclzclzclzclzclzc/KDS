@@ -25,6 +25,7 @@ python -m pytest -q      # 运行测试
 - SDK 依赖固定在 `requirements-dsh.txt`，接入测试见 `tests/test_harness.py`、`tests/test_harness_integration.py` 和 `tests/test_dsh_bridge.mjs`。真实运行时测试须显式设置 `KDS_TEST_DSH_RUNTIME=1`，只连接本机模拟 API。
 - `DSH_BASE_URL` 独立覆盖 Harness 子进程的地址，不能连带修改 `LLM_BASE_URL`。SDK 配套 0.1.5 使用普通 Chat Completions 根地址；本机 0.1.7 使用 `https://api.deepseek.com/anthropic`。模拟 API 必须校验请求路径，避免将真实服务会拒绝的 `/v1/messages` 当作成功请求。
 - 最终输出解析使用 JSON decoder，不能用非贪婪代码围栏正则截取（白板 JSON 字符串也会包含代码围栏）。`FinalFormatError` 才能触发 `app/json_repair.py` 的 Chat Completions JSON mode 请求；`DSH_JSON_BASE_URL` 独立于 Messages 地址，密钥/模型复用 DSH 配置。最多两次修正（0 关闭），共用本轮步骤、时间、输出预算，所有已报告用量经 `on_usage` 结算一次。有效发言与白板操作在本地保留；原文没有可解析的白板则不接受修正模型新增操作，不能重跑工具或把无效回复直接发布。空正文、已知截断、取消和运行时错误不属于格式修正。回归覆盖见 `tests/test_parsing.py`、`tests/test_json_repair.py`。
+- 人类可见工具日志由 `app/tool_logs.py` 从 `tool/call`、`tool/result` 生成，经 `_harness_progress` 持锁合并并持久化，按每次 KDS run + DSH step + call ID 区分调用。`harness_logs` 最多 200 条，`harness_log_rev` 驱动展示更新；常规 GET 返回 `harness_log_index` 摘要，带 `?tool_logs=1` 才返回正文，`to_dict()` 默认包含正文供数据库持久化。前端按 `agent_id` + 日志 `turn`（消息 `round + 1`）将折叠日志放在每轮发言前；正在进行的回合先独立显示，正文到达后合并，不能重复展示。新发言保存 `agent_id`，旧消息按角色名兼容匹配。不要把工具日志注入 `_history()` 或总结上下文。恢复时无结果的调用标为未完成；前端必须 HTML 转义工具数据，更新时保留展开状态、键盘焦点与内外滚动位置。浏览器回归为 `node tests/test_tool_logs_ui.cjs`（需可用 Playwright；`KDS_TEST_CHROMIUM` 可指定已有 Chromium）。
 
 - [app/engine.py](app/engine.py) — 核心。`ConversationRunner` 每个对话在**独立后台线程**里跑 `_run()` 主循环。这是并发与状态的关键，改动前务必理解：
   - 所有可变状态用 `self._lock` 保护；对外快照统一走 `to_dict()`。
