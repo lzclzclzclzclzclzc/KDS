@@ -3,3 +3,9 @@ werkzeug>=3.1.0,<3.1.2
 openai>=1.0
 numpy>=1.24
 python-dotenv>=1.0
+langgraph==1.2.12
+langgraph-checkpoint-sqlite==3.1.1
+# Keep the core/checkpoint combination reproducible and tracing optional.
+langchain-core==1.6.6
+langgraph-checkpoint==4.2.0
+langsmith==0.3.45

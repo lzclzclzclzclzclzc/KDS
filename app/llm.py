@@ -200,6 +200,30 @@ def _parse_turn(text: str) -> dict:
     }
 
 
+def _json_mode_unsupported(exc: Exception) -> bool:
+    """Only relax JSON mode for an explicit provider capability rejection."""
+    if getattr(exc, "status_code", None) not in (400, 422):
+        return False
+    body = getattr(exc, "body", None)
+    detail = body.get("error", body) if isinstance(body, dict) else None
+    if isinstance(detail, dict):
+        parameter_name = str(detail.get("param") or "").lower()
+        if parameter_name and parameter_name not in {"response_format", "json_mode"}:
+            return False
+        text = " ".join(str(detail.get(key) or "") for key in ("message", "param", "code"))
+    else:
+        text = str(exc)
+    text = text.lower()
+    parameter = any(value in text for value in (
+        "response_format", "response format", "json_mode", "json mode", "json_object",
+    ))
+    rejection = any(value in text for value in (
+        "unsupported", "not supported", "does not support", "unknown parameter",
+        "unrecognized parameter", "unrecognised parameter", "unrecognized request argument",
+    ))
+    return parameter and rejection
+
+
 class LLMClient:
     """Thin OpenAI-compatible client with an offline mock mode."""
 
@@ -244,9 +268,10 @@ class LLMClient:
             kwargs["response_format"] = {"type": "json_object"}
         try:
             resp = self._client.chat.completions.create(**kwargs)
-        except Exception:
-            # Some OpenAI-compatible providers reject response_format; retry without it.
-            if json_mode and "response_format" in kwargs:
+        except Exception as exc:
+            # Capability rejection may be retried without response_format;
+            # rate limits, transport errors and unrelated validation must propagate.
+            if json_mode and "response_format" in kwargs and _json_mode_unsupported(exc):
                 kwargs.pop("response_format", None)
                 resp = self._client.chat.completions.create(**kwargs)
             else:

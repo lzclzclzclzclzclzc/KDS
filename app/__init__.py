@@ -15,6 +15,8 @@ def create_app() -> Flask:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     init_db(DB_PATH)
     mark_stale_running_conversations()
+    from app.repositories.orchestration import OrchestrationRepository
+    OrchestrationRepository(DB_PATH).recover()
 
     from app.routes.api import api_bp
 

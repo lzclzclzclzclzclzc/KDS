@@ -10,6 +10,7 @@ from app.db import update_conversation
 from app.harness import HarnessManager, HarnessTurnError
 from app.llm import LLMClient
 from app.scheduler import update_heat, willingness_select
+from app.domain import context, whiteboard
 from app.tool_logs import MAX_TOOL_LOGS, tool_log_index
 
 
@@ -112,12 +113,13 @@ class ConversationRunner:
         self.pending_human_target: Optional[int] = None
         self._forced_next_idx: Optional[int] = None
         self._interrupt_requested = False
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._persist_lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._vote_thread: Optional[threading.Thread] = None
         self._vote_in_progress = False
         self._summary_in_progress = False
+        self._command_repository = None
 
         self._active_seconds = 0.0
         self._segment_start: Optional[float] = None
@@ -225,6 +227,7 @@ class ConversationRunner:
     def reserve(self, content: str) -> None:
         with self._lock:
             self.pending_human_message = content
+        self._persist()
 
     def _resolve_agent_idx(self, target: Optional[str]) -> Optional[int]:
         if not target:
@@ -245,16 +248,17 @@ class ConversationRunner:
             if self.status == "running":
                 self.pending_human_message = content
                 self.pending_human_target = target_idx
-                return "reserved"
-            if self.status == "paused" and not self._summary_in_progress:
+                mode = "reserved"
+            elif self.status == "paused" and not self._summary_in_progress:
                 self._append_message_nolock("human", "人类", content, 0)
                 self.turn += 1
                 if target_idx is not None:
                     self._forced_next_idx = target_idx
+                mode = "appended"
             else:
                 return None
         self._persist()
-        return "appended"
+        return mode
 
     def update_limits(
         self, total_max_tokens: Optional[int], total_duration_seconds: Optional[int]
@@ -282,6 +286,9 @@ class ConversationRunner:
             can_resume = self.status == "paused" and not self._limit_reached_nolock()
             return {
                 "id": self.id,
+                "orchestration_backend": "legacy",
+                "pending_human_message": self.pending_human_message,
+                "pending_human_target": self.pending_human_target,
                 "config_id": self.config_id,
                 "name": self.name,
                 "status": self.status,
@@ -396,6 +403,8 @@ class ConversationRunner:
         runner._end_vote_block_until_turn = int(conv.get("end_vote_block_until_turn", -1) or -1)
         fni = conv.get("forced_next_idx")
         runner._forced_next_idx = int(fni) if isinstance(fni, int) else None
+        runner.pending_human_message = conv.get("pending_human_message")
+        runner.pending_human_target = conv.get("pending_human_target")
         wb = conv.get("whiteboard") or {}
         runner.whiteboard_content = wb.get("content") or ""
         runner.whiteboard_rev = int(wb.get("rev") or 0)
@@ -410,131 +419,29 @@ class ConversationRunner:
     # ---- Context builders ----
 
     def _build_persona(self, agent: dict) -> str:
-        parts = [self.shared_background or "（无共享背景）"]
-        parts.append(f"\n\n你的名字是：{agent['name']}")
-        parts.append(f"\n\n【你自己的角色设定】\n{agent['system_prompt'] or '（未设定，自然参与即可）'}")
-
-        visible_others = []
-        for other in self.agents:
-            if other["id"] == agent["id"]:
-                continue
-            vis = other.get("visibility") or []
-            is_visible = (
-                vis == "all"
-                or (isinstance(vis, list) and ("all" in vis or agent["id"] in vis or agent["name"] in vis))
-            )
-            if is_visible:
-                visible_others.append(other)
-
-        if visible_others:
-            parts.append("\n\n【你被告知的其他参与者的角色设定】")
-            for other in visible_others:
-                parts.append(f"- {other['name']}: {other['system_prompt'] or '（未设定）'}")
-
-        return "\n".join(parts)
+        return context.build_persona(self, agent)
 
     def _is_proposer(self, agent: dict) -> bool:
-        if not self.end_vote_enabled:
-            return False
-        return agent["id"] in self.end_vote_proposers or agent["name"] in self.end_vote_proposers
+        return whiteboard.is_proposer(self, agent)
 
     def _can_edit_whiteboard(self, agent: dict) -> bool:
-        if not self.whiteboard_enabled:
-            return False
-        return agent["id"] in self.whiteboard_editors or agent["name"] in self.whiteboard_editors
+        return whiteboard.can_edit(self, agent)
 
     def _build_system(self, agent: dict) -> str:
-        base = self._build_persona(agent) + (
-            "\n\n你正在参与一场多人实时群聊。请以你角色的口吻，用中文自然发言。"
-        )
-        can_end = self._is_proposer(agent)
-        can_wb = self._can_edit_whiteboard(agent)
-
-        fields = [
-            '"speech"：字符串，你本轮要说的话（用中文，直接说话，不要加「某某说：」之类前缀）',
-        ]
-        if can_end:
-            fields.append(
-                '"propose_end"：布尔值。若你认为这场对话可以结束了就设为 true，'
-                "这会发起一次全体投票，只有所有参与者都同意才会结束；不想结束就设为 false 或省略"
-            )
-        if can_wb:
-            fields.append(
-                '"whiteboard"：对象，用于对共享白板做增量修改；本轮不改就省略或设为 null。'
-                '格式为 {"ops": [...]}，每个 op 可为：'
-                '{"op":"append","content":"追加到白板末尾的内容"}、'
-                '{"op":"replace","find":"白板中已有的原文片段","replace":"替换后的新内容"}、'
-                '{"op":"prepend","content":"加到白板开头的内容"}'
-            )
-        base += (
-            "\n\n最终交付请只输出一个 JSON 对象，不要输出任何多余文字，包含以下字段：\n"
-            + "\n".join(f"- {f}" for f in fields)
-        )
-        if self.harness is not None:
-            base += (
-                "\n\n在最终交付前，你可以按需使用已启用的工具查资料、读取文件或计算。"
-                "不要为了使用工具而使用工具；引用外部资料时在 speech 中给出来源。"
-                "上面的 JSON 约束仅针对最终交付，工具调用走工具协议。"
-                "仅完成当前角色的本轮任务，发言调度、投票和共享白板由 KDS 管理。"
-                "白板只能通过最终 JSON 修改，工具产物保存在自己的工作目录。"
-            )
-        if can_wb:
-            fmt = "HTML" if self.whiteboard_format == "html" else "Markdown"
-            current = self.whiteboard_content or "（当前白板为空）"
-            base += (
-                f"\n\n【共享白板】这是本次群聊要沉淀的最终产出物，格式为 {fmt}，"
-                "请在合适时机通过 whiteboard 字段逐步完善它。当前白板内容如下：\n"
-                f"---\n{current}\n---"
-            )
-        return base
+        return context.build_system(self, agent)
 
     @staticmethod
     def _apply_whiteboard_ops(content: str, ops: list) -> str:
-        """Apply incremental whiteboard ops. Defensive: unknown/no-match ops are skipped."""
-        for op in ops:
-            if not isinstance(op, dict):
-                continue
-            kind = str(op.get("op") or "").lower()
-            if not kind:
-                if "find" in op or "replace" in op:
-                    kind = "replace"
-                elif "prepend" in op:
-                    kind = "prepend"
-                elif "append" in op or "content" in op:
-                    kind = "append"
-            if kind == "set":
-                content = str(op.get("content", ""))
-            elif kind == "append":
-                text = str(op.get("content", op.get("append", "")) or "")
-                if text:
-                    sep = "\n" if content and not content.endswith("\n") else ""
-                    content = content + sep + text
-            elif kind == "prepend":
-                text = str(op.get("content", op.get("prepend", "")) or "")
-                if text:
-                    sep = "\n" if content and not text.endswith("\n") else ""
-                    content = text + sep + content
-            elif kind == "replace":
-                find = str(op.get("find", "") or "")
-                repl = str(op.get("replace", op.get("with", op.get("content", ""))) or "")
-                if find and find in content:
-                    content = content.replace(find, repl, 1)
-        return content
+        return whiteboard.apply_ops(content, ops)
 
     def _build_score_system(self, agent: dict) -> str:
-        return self._build_persona(agent) + (
-            "\n\n你正在参与一场多人实时群聊。现在需要你评估："
-            "基于当前对话内容，你有多想发言。"
-        )
+        return context.build_score_system(self, agent)
 
     def _history(self) -> list[dict]:
-        return [
-            {"role": "user", "content": f"{m['speaker']}: {m['content']}"}
-            for m in self.messages
-        ]
+        return context.history(self)
 
     def _log_text(self) -> str:
-        return "\n".join(f"{m['speaker']}: {m['content']}" for m in self.messages)
+        return context.log_text(self)
 
     # ---- Scheduling ----
 
@@ -898,15 +805,7 @@ class ConversationRunner:
             return False
 
     def _build_vote_system(self, agent: dict, question: str, options: list[str], votes_per_person: int) -> str:
-        options_text = "\n".join(f"{i + 1}. {o}" for i, o in enumerate(options))
-        return self._build_persona(agent) + (
-            "\n\n你正在参与群聊中的投票。请基于当前对话内容和你自己的角色立场投票。"
-            "\n投票题目：\n" + question +
-            "\n\n选项：\n" + options_text +
-            f"\n\n你有 {votes_per_person} 票，可以对不同选项任意分配，也可以重复投给同一选项。"
-            '请只输出 JSON 对象，格式：{"choices": ["1", "2"], "reason": "简短理由"}，'
-            "choices 数组长度应等于你的票数，每项是选项编号。"
-        )
+        return context.build_vote_system(self, agent, question, options, votes_per_person)
 
     def start_vote(self, question: str, options: list[str], votes_per_person: int) -> Optional[dict]:
         question = (question or "").strip()
@@ -1051,7 +950,13 @@ class ConversationRunner:
         try:
             with self._persist_lock:
                 snapshot = self.to_dict()
-                update_conversation(self.id, snapshot, status=snapshot["status"])
+                saved = update_conversation(self.id, snapshot, status=snapshot["status"])
+                if saved is not None:
+                    from app.repositories.orchestration import OrchestrationRepository
+                    if self._command_repository is None:
+                        self._command_repository = OrchestrationRepository()
+                    self._command_repository.sync_legacy_reservation(
+                        self.id, snapshot.get("pending_human_message"), snapshot.get("pending_human_target"))
         except Exception:
             # Persistence failures should not kill the conversation thread.
             pass

@@ -18,6 +18,7 @@ from app.db import (
 )
 from app.engine import RUNNERS, RUNNERS_LOCK, ConversationRunner
 from app.llm import LLMClient
+from app.services.conversations import conversation_service
 from app.tool_logs import tool_log_index
 
 api_bp = Blueprint("api", __name__)
@@ -32,16 +33,7 @@ def _err(message: str, status: int = 400):
 
 def _load_runner(conv_id: str, allowed_statuses: tuple[str, ...]) -> tuple[ConversationRunner | None, dict | None]:
     """Reuse one runner when simultaneous requests revive a stored conversation."""
-    with RUNNERS_LOCK:
-        runner = RUNNERS.get(conv_id)
-        if runner is not None:
-            return runner, None
-        record = get_conversation(conv_id)
-        if record is None or record.get("status") not in allowed_statuses:
-            return None, record
-        runner = ConversationRunner.from_payload(record, _llm)
-        RUNNERS[conv_id] = runner
-        return runner, record
+    return conversation_service.load(conv_id, allowed_statuses, _llm, get_record=get_conversation)
 
 
 def _clean_config(payload: dict) -> tuple[str, dict]:
@@ -262,7 +254,11 @@ def conversations_create():
         "whiteboard_format": config.get("whiteboard_format", "md"),
         "whiteboard_editors": config.get("whiteboard_editors", []),
     }
-    runner = ConversationRunner(conv_id, config_id, name, config_payload, _llm)
+    try:
+        runner = conversation_service.create_runner(conv_id, config_id, name, config_payload, _llm,
+                                                    payload.get("orchestration_backend"))
+    except ValueError as exc:
+        return _err(str(exc))
     initial = runner.to_dict()
     create_conversation(conv_id, config_id, name, initial, status="running")
     with RUNNERS_LOCK:
@@ -416,14 +412,22 @@ def conversations_summarize(conv_id):
 
 @api_bp.delete("/api/conversations/<conv_id>")
 def conversations_delete(conv_id):
-    with RUNNERS_LOCK:
-        runner = RUNNERS.pop(conv_id, None)
-        if runner is not None:
-            runner.interrupt()
-        ok = delete_conversation(conv_id)
+    ok = conversation_service.delete(conv_id)
     if not ok:
         return _err("对话不存在", 404)
     return jsonify({"ok": True})
+
+
+@api_bp.post("/api/conversations/<conv_id>/orchestration")
+def conversations_migrate(conv_id):
+    backend = (request.get_json(silent=True) or {}).get("orchestration_backend")
+    try:
+        runner = conversation_service.migrate(conv_id, backend, _llm)
+    except ValueError as exc:
+        return _err(str(exc), 409)
+    if runner is None:
+        return _err("对话不存在", 404)
+    return jsonify(runner.to_dict())
 
 
 # ---- Assistant ----
