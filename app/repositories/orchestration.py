@@ -21,6 +21,10 @@ class RepositoryConflict(RuntimeError):
 _JSON_FIELDS = {"input", "selection", "result", "output", "committed_snapshot", "error", "payload"}
 _OP_FIELDS = {"status", "runner_epoch", "input", "selection", "result", "output", "error", "committed_rev"}
 _ATTEMPT_FIELDS = {"status", "result", "error"}
+_OP_METADATA_COLUMNS = (
+    "operation_id, parent_operation_id, conversation_id, kind, status, runner_epoch, "
+    "error, committed_rev, recovered_at, created_at, updated_at"
+)
 
 
 def _encode(value):
@@ -140,12 +144,19 @@ class OrchestrationRepository:
             )
             return _decode(conn.execute("SELECT * FROM orchestration_operations WHERE operation_id = ?", (operation_id,)).fetchone())
 
-    def get_operation(self, operation_id):
-        return _decode(self._read("SELECT * FROM orchestration_operations WHERE operation_id = ?", (operation_id,)))
+    def get_operation(self, operation_id, *, include_payload=True):
+        columns = "*" if include_payload else _OP_METADATA_COLUMNS
+        return _decode(self._read(f"SELECT {columns} FROM orchestration_operations WHERE operation_id = ?", (operation_id,)))
 
-    def list_operations(self, conversation_id, kind=None, statuses=None):
-        query = "SELECT * FROM orchestration_operations WHERE conversation_id = ?"
+    def list_operations(self, conversation_id, kind=None, statuses=None, *,
+                        parent_operation_id=None, include_payload=True):
+        """Filter in SQLite; metadata reads never load histories or old snapshots."""
+        columns = "*" if include_payload else _OP_METADATA_COLUMNS
+        query = f"SELECT {columns} FROM orchestration_operations WHERE conversation_id = ?"
         args = [conversation_id]
+        if parent_operation_id is not None:
+            query += " AND parent_operation_id = ?"
+            args.append(parent_operation_id)
         if kind is not None:
             query += " AND kind = ?"
             args.append(kind)
@@ -155,6 +166,18 @@ class OrchestrationRepository:
             query += " AND status IN (" + ",".join("?" for _ in statuses) + ")"
             args.extend(statuses)
         return [_decode(row) for row in self._read(query + " ORDER BY created_at, operation_id", args, many=True)]
+
+    def list_operation_tree(self, conversation_id, operation_id):
+        """Return only metadata for this root and its descendants, including terminals."""
+        return [_decode(row) for row in self._read(
+            "WITH RECURSIVE descendants(operation_id) AS ("
+            "SELECT operation_id FROM orchestration_operations WHERE conversation_id = ? AND operation_id = ? "
+            "UNION SELECT child.operation_id FROM orchestration_operations AS child "
+            "JOIN descendants AS parent ON child.parent_operation_id = parent.operation_id "
+            "WHERE child.conversation_id = ?) "
+            f"SELECT {_OP_METADATA_COLUMNS} FROM orchestration_operations "
+            "WHERE operation_id IN (SELECT operation_id FROM descendants) ORDER BY created_at, operation_id",
+            (conversation_id, operation_id, conversation_id), many=True)]
 
     def update_operation(self, operation_id, **fields):
         if not fields or set(fields) - _OP_FIELDS:

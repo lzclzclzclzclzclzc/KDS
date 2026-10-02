@@ -316,3 +316,39 @@ def test_file_checkpoint_resumes_failed_node_and_emits_custom_events(tmp_path):
         assert graph.get_state(config).next == ()
     finally:
         close_savers(path)
+
+
+def test_metadata_queries_filter_children_without_decoding_payloads(repo):
+    _insert(repo, "other")
+    for operation, conversation, parent in (
+        ("root", "chat", None), ("child", "chat", "root"),
+        ("unrelated", "chat", "another-root"), ("foreign", "other", "root"),
+    ):
+        repo.create_operation(operation, conversation, "turn", parent_operation_id=parent)
+    # Historical payloads are not needed for control checks, even if their JSON
+    # can no longer be decoded. SELECT * followed by dropping fields would fail.
+    with sqlite3.connect(repo.db_path) as conn:
+        conn.execute("UPDATE orchestration_operations SET input = 'unreadable', committed_snapshot = 'unreadable'")
+    rows = repo.list_operations("chat", kind="turn", statuses=("prepared",),
+                                parent_operation_id="root", include_payload=False)
+    assert [row["operation_id"] for row in rows] == ["child"]
+    assert "input" not in rows[0] and "committed_snapshot" not in rows[0]
+    assert repo.get_operation("child", include_payload=False) == rows[0]
+    assert repo.list_operations("chat", statuses=(), include_payload=False) == []
+    assert repo.get_operation("missing", include_payload=False) is None
+
+
+def test_operation_tree_crosses_terminal_parents_but_not_other_conversations(repo):
+    _insert(repo, "other")
+    for operation, conversation, parent, status in (
+        ("root", "chat", None, "abandoned"),
+        ("vote", "chat", "root", "committed"),
+        ("ballot", "chat", "vote", "uncertain"),
+        ("unrelated", "chat", None, "running"),
+        ("foreign", "other", "vote", "running"),
+    ):
+        repo.create_operation(operation, conversation, "vote", parent_operation_id=parent, status=status)
+    assert {row["operation_id"] for row in repo.list_operation_tree("chat", "root")} == {
+        "root", "vote", "ballot"}
+    assert repo.list_operation_tree("chat", "missing") == []
+    assert repo.list_operation_tree("other", "root") == []

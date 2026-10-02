@@ -69,7 +69,7 @@ class ConversationService:
             if record.get("orchestration_backend", "legacy") == "langgraph":
                 from app.repositories.orchestration import OrchestrationRepository
                 repo = old.repository if old is not None else OrchestrationRepository()
-                pending = repo.list_operations(conv_id, statuses=("prepared", "running", "result_ready", "uncertain"))
+                pending = repo.list_operations(conv_id, statuses=("prepared", "running", "result_ready", "uncertain"), include_payload=False)
                 if pending:
                     raise ValueError("存在未对账操作，请先恢复并完成当前推进单元")
             record["orchestration_backend"] = backend

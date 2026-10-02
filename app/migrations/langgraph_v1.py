@@ -28,6 +28,10 @@ def migrate(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS orchestration_operations_conversation
             ON orchestration_operations(conversation_id, created_at);
+        CREATE INDEX IF NOT EXISTS orchestration_operations_parent
+            ON orchestration_operations(conversation_id, parent_operation_id, created_at, operation_id);
+        CREATE INDEX IF NOT EXISTS orchestration_operations_kind_status
+            ON orchestration_operations(conversation_id, kind, status, created_at, operation_id);
         CREATE TABLE IF NOT EXISTS orchestration_attempts (
             attempt_id TEXT PRIMARY KEY,
             operation_id TEXT NOT NULL,

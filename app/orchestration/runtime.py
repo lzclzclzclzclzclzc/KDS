@@ -215,29 +215,22 @@ class GraphRunner(ConversationRunner):
             self._persist()
 
     def _abandon_outdated_operations(self):
-        for op in self.repository.list_operations(self.id, kind="advance", statuses=("prepared", "running", "result_ready", "uncertain", "abandoned")):
-            turn = self.repository.get_operation(op["operation_id"] + ":turn")
+        for op in self.repository.list_operations(self.id, kind="advance", statuses=("prepared", "running", "result_ready", "uncertain", "abandoned"), include_payload=False):
+            turn = self.repository.get_operation(op["operation_id"] + ":turn", include_payload=False)
             if turn is None or turn["status"] != "committed":
                 self._abandon_operation_tree(op["operation_id"])
 
     def _abandon_operation_tree(self, operation):
         """Discard public effects from outdated inputs; retain attempts and usage."""
         with self._lock:
-            operations = self.repository.list_operations(self.id)
-            descendants = {operation}
-            while True:
-                found = {op["operation_id"] for op in operations if op["parent_operation_id"] in descendants}
-                if found <= descendants:
-                    break
-                descendants.update(found)
-            for op in operations:
-                if op["operation_id"] in descendants and op["status"] not in {"committed", "abandoned"}:
+            for op in self.repository.list_operation_tree(self.id, operation):
+                if op["status"] not in {"committed", "abandoned"}:
                     self.repository.update_operation(op["operation_id"], status="abandoned",
                                                      runner_epoch=self.runner_epoch)
 
     def _effect(self, operation_id, apply, **kwargs):
         with self._lock:
-            op = self.repository.get_operation(operation_id)
+            op = self.repository.get_operation(operation_id, include_payload=False)
             if self._deleted or op is None or op["status"] == "abandoned":
                 raise RepositoryConflict("操作已失效")
             if operation_id in self._unsafe_operations:
@@ -277,8 +270,8 @@ class GraphRunner(ConversationRunner):
             try:
                 current = self.repository.get_conversation(self.id) if not self._deleted else None
                 if operation is not None:
-                    op = self.repository.get_operation(operation)
-                    parent = self.repository.get_operation(op["parent_operation_id"]) if op and op["parent_operation_id"] else None
+                    op = self.repository.get_operation(operation, include_payload=False)
+                    parent = self.repository.get_operation(op["parent_operation_id"], include_payload=False) if op and op["parent_operation_id"] else None
                     if (op is None or op["status"] in {"committed", "abandoned", "result_ready"}
                             or parent and parent["status"] == "abandoned"):
                         return
@@ -331,7 +324,7 @@ class GraphRunner(ConversationRunner):
             if self._deleted:
                 raise RepositoryConflict("对话已删除")
             if parent:
-                root = self.repository.get_operation(parent)
+                root = self.repository.get_operation(parent, include_payload=False)
                 if root and root["status"] == "abandoned":
                     raise RepositoryConflict("操作已失效")
             op = self.repository.create_operation(operation, self.id, kind, input=inputs,
@@ -401,7 +394,7 @@ class GraphRunner(ConversationRunner):
                 if op["input"].get("graph_version") != self.graph_version:
                     raise UnsafeRecoveryError("图版本不兼容，请先对账未完成操作")
                 op = self._adopt_operation(op["operation_id"])
-                child = self.repository.get_operation(op["operation_id"] + ":turn")
+                child = self.repository.get_operation(op["operation_id"] + ":turn", include_payload=False)
                 if child is None or child["status"] != "committed":
                     if (op["input"]["message_count"] != len(self.messages)
                             or op["input"]["whiteboard_rev"] != self.whiteboard_rev):
@@ -433,8 +426,8 @@ class GraphRunner(ConversationRunner):
                 # Durable receipts can rebuild a lost checkpoint; uncertain
                 # external calls must never be transparently repeated.
                 retry_turn = False
-                for child in self.repository.list_operations(self.id):
-                    if child["parent_operation_id"] == op["operation_id"] and child["kind"] in {"turn", "score"}:
+                for child in self.repository.list_operations(self.id, parent_operation_id=op["operation_id"], include_payload=False):
+                    if child["kind"] in {"turn", "score"}:
                         try:
                             self._adopt_operation(child["operation_id"])
                         except UnsafeRecoveryError:
@@ -447,7 +440,8 @@ class GraphRunner(ConversationRunner):
                             with self._lock:
                                 self._abandon_operation_tree(op["operation_id"])
                                 if self._forced_next_idx is None:
-                                    self._forced_next_idx = self._resolve_agent_idx(child["input"]["agent"]["id"])
+                                    turn_input = self.repository.get_operation(child["operation_id"])["input"]
+                                    self._forced_next_idx = self._resolve_agent_idx(turn_input["agent"]["id"])
                                 self._persist()
                             self._allow_uncertain_retry = False
                             retry_turn = True

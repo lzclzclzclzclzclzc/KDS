@@ -22,11 +22,11 @@ class TurnNodes:
         return self.runner.repository.get_operation(state["operation_id"])
 
     def stale(self, state):
-        op = self.operation(state)
+        op = self.runner.repository.get_operation(state["operation_id"], include_payload=False)
         return op is None or op["status"] == "abandoned" or self.runner._deleted
 
     def load_operation(self, state):
-        op = self.operation(state)
+        op = self.runner.repository.get_operation(state["operation_id"], include_payload=False)
         if op is None:
             raise RuntimeError("找不到讨论操作记录")
         turn = self.runner.repository.get_operation(state["operation_id"] + ":turn")
