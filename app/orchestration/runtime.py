@@ -237,7 +237,8 @@ class GraphRunner(ConversationRunner):
                 raise UnsafeRecoveryError("本次调用的关键记录保存失败，不能发布迟到结果")
             if op["status"] == "committed":
                 return
-            self.repository.update_operation(operation_id, runner_epoch=self.runner_epoch)
+            if op["runner_epoch"] != self.runner_epoch:
+                self.repository.update_operation(operation_id, runner_epoch=self.runner_epoch)
             fields = ("messages", "votes", "heat", "turn", "last_agent_idx", "whiteboard_content",
                       "whiteboard_rev", "whiteboard_last_editor", "harness_state", "harness_activity",
                       "harness_logs", "harness_log_rev", "_rr_index", "_forced_next_idx",
@@ -305,6 +306,8 @@ class GraphRunner(ConversationRunner):
                 # Roots have no external attempts. An explicitly failed attempt
                 # is also distinct from an interrupted/unknown external effect.
                 fields["status"] = "prepared"
+            if all(op.get(key) == value for key, value in fields.items()):
+                return op
             return self.repository.update_operation(operation, **fields)
 
     def _finalize_auxiliary_child(self, operation):
