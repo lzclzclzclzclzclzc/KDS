@@ -1,5 +1,6 @@
 """Run the public conversation contract against both engines."""
 import threading
+import sqlite3
 from unittest.mock import patch
 
 import pytest
@@ -161,3 +162,38 @@ def test_many_units_do_not_share_recursion_budget(make_runner):
     run(runner)
     assert runner.turn == 41
     assert runner.paused_reason == "limit"
+
+
+def test_round_robin_skips_score_context_and_historical_payloads(make_runner, monkeypatch):
+    runner = make_runner()
+    runner.repository.create_operation("historical", runner.id, "advance", status="committed")
+    with sqlite3.connect(runner.repository.db_path) as conn:
+        conn.execute("UPDATE orchestration_operations SET input = 'unreadable', "
+                     "committed_snapshot = 'unreadable' WHERE operation_id = 'historical'")
+
+    def unexpected_context(*args):
+        raise AssertionError("轮流发言不应生成评分上下文")
+
+    monkeypatch.setattr(runner, "_build_score_system", unexpected_context)
+    monkeypatch.setattr(runner, "_log_text", unexpected_context)
+    run(runner)
+    assert [message["speaker"] for message in runner.messages] == ["甲", "乙", "丙"]
+    assert runner.total_output_tokens == 15
+
+
+def test_willingness_scores_keep_frozen_context_and_agent_order(make_runner):
+    histories = []
+    llm = scripted_llm()
+
+    def score(name, system, history, turn):
+        histories.append((name, history, turn))
+        return 50, {"prompt_tokens": 0, "completion_tokens": 0}
+
+    llm.willingness_score = score
+    runner = make_runner(cfg=config(scheduling_mode="willingness", total_max_tokens=10), llm=llm)
+    run(runner)
+    assert len(runner.messages) == 2
+    assert sorted(name for name, _, _ in histories) == sorted(["甲", "乙", "丙"])
+    assert [score["name"] for score in runner.messages[-1]["scores"]] == ["甲", "乙", "丙"]
+    assert all(turn == 1 and history == "甲: 甲发言" for _, history, turn in histories)
+    assert runner.total_output_tokens == 10

@@ -12,6 +12,7 @@ from app.orchestration.backends import AgentTurnExecutor
 from app.orchestration.batch_graph import build_batch_graph, BatchRuntime
 from app.orchestration.checkpointer import get_saver
 from app.orchestration.nodes import TurnNodes
+from app.orchestration.policies import policy_for
 from app.orchestration.summary_graph import build_summary_graph, SummaryRuntime
 from app.orchestration.turn_graph import build_turn_graph, TurnContext
 from app.orchestration.vote_graph import build_vote_graph
@@ -407,14 +408,18 @@ class GraphRunner(ConversationRunner):
                 else:
                     return op
             operation_id = uuid.uuid4().hex
+            score_jobs = []
+            if policy_for(self).needs_scores(self):
+                history_text = self._log_text()
+                score_jobs = [{"agent_id": a["id"], "agent_name": a["name"],
+                               "system": self._build_score_system(a), "history_text": history_text,
+                               "turn": self.turn} for a in self.agents]
             return self.repository.create_operation(operation_id, self.id, "advance", status="running",
                 runner_epoch=self.runner_epoch, input={
                     "seed": random.getrandbits(64), "message_count": len(self.messages),
                     "whiteboard_rev": self.whiteboard_rev, "history": self._history(),
                     "graph_version": self.graph_version,
-                    "score_jobs": [{"agent_id": a["id"], "agent_name": a["name"],
-                                    "system": self._build_score_system(a), "history_text": self._log_text(),
-                                    "turn": self.turn} for a in self.agents],
+                    "score_jobs": score_jobs,
                 })
 
     def _run(self):
@@ -522,9 +527,10 @@ class GraphRunner(ConversationRunner):
             vote = next(v for v in self.votes if v["id"] == vote_id)
             if vote["status"] in {"completed", "error"}:
                 return bool(vote.get("agreed"))
+            history_text = self._log_text()
             jobs = [{"agent_id": a["id"], "agent_name": a["name"],
                      "system": self._build_vote_system(a, vote["question"], vote["options"], vote["votes_per_person"]),
-                     "history_text": self._log_text(), "question": vote["question"], "options": vote["options"],
+                     "history_text": history_text, "question": vote["question"], "options": vote["options"],
                      "votes_per_person": vote["votes_per_person"]} for a in self.agents]
             op = self.repository.create_operation(operation, self.id, "vote", parent_operation_id=parent,
                 runner_epoch=self.runner_epoch, input={"jobs": jobs, "options": vote["options"], "kind": vote.get("kind", "normal")})
