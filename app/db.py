@@ -15,12 +15,14 @@ def _now() -> str:
 
 
 def _connect(db_path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(db_path), check_same_thread=False)
+    conn = sqlite3.connect(str(db_path), check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 30000")
     return conn
 
 
 def init_db(db_path: Path = DB_PATH) -> None:
+    db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with _lock:
         conn = _connect(db_path)
@@ -49,6 +51,8 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 )
                 """
             )
+            from app.migrations.langgraph_v1 import migrate
+            migrate(conn)
             conn.commit()
         finally:
             conn.close()
@@ -75,7 +79,14 @@ def _row_to_conversation(row: sqlite3.Row) -> dict:
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         **payload,
+        "state_rev": row["state_rev"] if "state_rev" in row.keys() else 0,
     }
+
+
+def _revision_update(conn: sqlite3.Connection) -> str:
+    # A few legacy importers use the original schema until init_db is called.
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(conversations)")}
+    return ", state_rev = state_rev + 1" if "state_rev" in columns else ""
 
 
 def create_config(record_id: str, name: str, payload: dict) -> dict:
@@ -160,14 +171,15 @@ def update_conversation(record_id: str, payload: dict, status: Optional[str] = N
     with _lock:
         conn = _connect(DB_PATH)
         try:
+            revision = _revision_update(conn)
             if status is not None:
                 conn.execute(
-                    "UPDATE conversations SET payload = ?, status = ?, updated_at = ? WHERE id = ?",
+                    "UPDATE conversations SET payload = ?, status = ?, updated_at = ?" + revision + " WHERE id = ?",
                     (json.dumps(payload, ensure_ascii=False), status, _now(), record_id),
                 )
             else:
                 conn.execute(
-                    "UPDATE conversations SET payload = ?, updated_at = ? WHERE id = ?",
+                    "UPDATE conversations SET payload = ?, updated_at = ?" + revision + " WHERE id = ?",
                     (json.dumps(payload, ensure_ascii=False), _now(), record_id),
                 )
             conn.commit()
@@ -200,6 +212,16 @@ def delete_conversation(record_id: str) -> bool:
     with _lock:
         conn = _connect(DB_PATH)
         try:
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            if "orchestration_attempts" in tables:
+                conn.execute(
+                    "DELETE FROM orchestration_attempts WHERE operation_id IN "
+                    "(SELECT operation_id FROM orchestration_operations WHERE conversation_id = ?)",
+                    (record_id,),
+                )
+            for table in ("usage_events", "orchestration_commands", "orchestration_operations"):
+                if table in tables:
+                    conn.execute(f"DELETE FROM {table} WHERE conversation_id = ?", (record_id,))
             cur = conn.execute("DELETE FROM conversations WHERE id = ?", (record_id,))
             conn.commit()
         finally:
@@ -214,6 +236,7 @@ def mark_stale_running_conversations() -> None:
         try:
             rows = conn.execute("SELECT id, payload, status FROM conversations").fetchall()
             now = _now()
+            revision = _revision_update(conn)
             for row in rows:
                 payload = json.loads(row["payload"])
                 changed = False
@@ -249,7 +272,7 @@ def mark_stale_running_conversations() -> None:
                 if not changed:
                     continue
                 conn.execute(
-                    "UPDATE conversations SET status = ?, payload = ?, updated_at = ? WHERE id = ?",
+                    "UPDATE conversations SET status = ?, payload = ?, updated_at = ?" + revision + " WHERE id = ?",
                     (payload["status"], json.dumps(payload, ensure_ascii=False), now, row["id"]),
                 )
             conn.commit()

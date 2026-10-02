@@ -42,6 +42,16 @@ PORT = _int("PORT", 5000)
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "kds.db"
 
+# The backend is stored in each conversation; this only controls new chats.
+ORCHESTRATION_BACKEND = os.getenv("ORCHESTRATION_BACKEND", "langgraph").strip().lower()
+if ORCHESTRATION_BACKEND not in {"legacy", "langgraph"}:
+    ORCHESTRATION_BACKEND = "langgraph"
+LANGGRAPH_CHECKPOINT_PATH = Path(os.getenv(
+    "LANGGRAPH_CHECKPOINT_PATH", str(DATA_DIR / "langgraph_checkpoints.db")
+)).expanduser()
+GRAPH_MAX_CONCURRENCY = max(1, _int("GRAPH_MAX_CONCURRENCY", 1))
+AUXILIARY_MAX_CONCURRENCY = max(1, _int("AUXILIARY_MAX_CONCURRENCY", 4))
+
 # Discussion turns use Harness; auxiliary scoring/voting keep the LLM_* route.
 AGENT_BACKEND = os.getenv("AGENT_BACKEND", "dsh").strip().lower()
 DSH_MODEL = os.getenv("DSH_MODEL", "deepseek-v4-flash").strip()

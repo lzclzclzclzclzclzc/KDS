@@ -54,3 +54,13 @@ python -m pytest -q      # 运行测试
 - agent 的 `visibility` 可为 `"all"`、含 `"all"` 的列表、或具体 id/name 列表——决定该角色的设定对谁可见（见 `_build_persona`）。
 - 修改 `to_dict()` 的输出结构时注意：它同时用于 API 响应、SQLite 持久化、以及 `from_payload()` 复活，三者必须保持字段兼容。
 - 数据库文件在 `data/kds.db`（gitignore），首次运行自动建库。
+# LangGraph 编排
+
+- 新对话默认 `ORCHESTRATION_BACKEND=langgraph`，旧记录无编排字段按 legacy；agent_backend 的 direct/dsh 与编排后端独立。
+- `app/services/conversations.py` 统一选择/恢复/迁移引擎，兼容注册表仍是 `app.engine.RUNNERS`。迁移只在暂停、线程已退出且无未对账操作时进行。
+- `app/orchestration/turn_graph.py` 是有限推进单元：控制、人工预约、评分、选人、执行、提交、结束投票、收尾。`runtime.py` 管理执行权与线程，`nodes.py` 管理回合阶段。不要把业务分支塞回运行器循环。
+- `batch_graph.py` 用 Send/Overwrite/reducer 汇合评分和票据；结果按角色顺序输出。普通与结束投票复用 vote_graph；summary_graph 保留人工完成及失败仍完成的合同。
+- `app/domain/` 保存原上下文/权限/白板纯规则，legacy与图共用。不得改变角色设定可见性方向或把工具日志加入公开历史。
+- `app/repositories/orchestration.py` 用短事务处理CAS、epoch、command、operation、attempt、usage。公开消息及白板按operation幂等提交；已知用量按attempt内事件去重。关键写入失败停止派发，不吞异常继续运行。
+- `app/orchestration/checkpointer.py` 管理共享SQLite saver，业务库与检查点库分开。图调用用 durability=sync；恢复待运行节点用 invoke(None)，新operation才给新输入。缺失/不兼容检查点只能在已对账的安全边界重建。
+- 所有模型、故障与恢复测试使用临时数据库与离线模型；真实API仍需显式启用，不默认收费调用。

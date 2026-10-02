@@ -277,6 +277,10 @@ class HarnessManager:
             seen.add(key)
             delta = event_usage(event)
             if delta["total_tokens"]:
+                delta["_event_id"] = json.dumps(
+                    ["dsh", control["run_id"], payload.get("sessionId"), event.get("seq")],
+                    separators=(",", ":"),
+                )
                 record_usage(delta)
             event_type = event.get("type")
             if event_type == "step/start":
@@ -372,6 +376,7 @@ class HarnessManager:
                     result.final_response, error, activity, output_budget, budget_reason,
                     usage, deadline, lambda: cancel_reason[0] if cancel_reason else should_stop(),
                     on_progress, record_usage,
+                    usage_identity=(control["run_id"], session_id),
                 )
             if cancel_reason:
                 raise cancelled_error()
@@ -391,7 +396,7 @@ class HarnessManager:
             watcher.join()
 
     def _repair_final(self, original, error, activity, budget, budget_reason,
-                      usage, deadline, should_stop, on_progress, on_usage):
+                      usage, deadline, should_stop, on_progress, on_usage, *, usage_identity):
         source = _extract_json(original)
         source = source if isinstance(source, dict) else {}
         kept_speech = source.get("speech")
@@ -449,7 +454,9 @@ class HarnessManager:
                 raise HarnessTurnError(
                     f"JSON mode 修正请求失败（{type(exc).__name__}），请检查 DSH_JSON_BASE_URL 与 API 配置。"
                 ) from exc
-            on_usage(reply.usage)
+            on_usage({**reply.usage, "_event_id": json.dumps(
+                ["json_repair", *usage_identity, attempt + 1], separators=(",", ":"),
+            )})
             reason = should_stop()
             if reason or time.monotonic() >= deadline:
                 raise HarnessTurnError("JSON 格式修正已停止。", reason or "timeout")

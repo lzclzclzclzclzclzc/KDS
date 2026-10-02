@@ -192,6 +192,30 @@ KDS/
 └─ tests/               # 单元测试
 ```
 
+## LangGraph 编排与历史兼容
+
+新建对话默认通过 LangGraph 的有限回合图推进，意愿评分、投票和人工总结有独立工作流。角色发言仍然顺序执行，DSH 内部工具循环、权限与格式修正规则沿用原实现。只有人工「总结并完成」会把对话标为完成。
+
+`requirements.txt` 固定 `langgraph==1.2.12` 与 `langgraph-checkpoint-sqlite==3.1.1`，两者声明支持 Python 3.10+。本次本地执行验证使用 Python 3.13；没有实测所有 Python 次版本。LangSmith 服务与账户不是运行前提。
+
+```env
+ORCHESTRATION_BACKEND=langgraph
+GRAPH_MAX_CONCURRENCY=1
+AUXILIARY_MAX_CONCURRENCY=4
+```
+
+`GRAPH_MAX_CONCURRENCY` 控制一个评分或投票批次同时执行的角色数，可改为 2 或 3；`AUXILIARY_MAX_CONCURRENCY` 控制所有讨论共享的辅助调用上限。默认批次并发为 1。评分和投票固定输入历史，按原角色顺序输出结果；单个角色失败不会把缺失票据当成同意。
+
+业务记录仍保存在 `data/kds.db`，检查点另存在 `data/langgraph_checkpoints.db`（可通过 `LANGGRAPH_CHECKPOINT_PATH` 指定）。操作、尝试和用量事件用于结果复用、消息与白板的原子提交及消耗去重。关键写入失败会暂停推进并显示错误，恢复时优先提交已保存的有效结果。两份数据库没有跨库原子事务，检查点不能保证外部工具副作用恰好执行一次。
+
+启动时先暂停遗留的运行状态，普通投票与结束投票标记中断，确定的总结结果离线对账；不会自动请求模型。运行中人工预约保存为一个槽位，新预约覆盖旧预约；暂停不会丢弃预约。有兼容检查点且用户明确继续时，不确定的 DSH 回合会通过新操作和新会话重新组织原角色，可能再次执行工具；缺失检查点、图版本不兼容或关键用量保存失败时先对账，也可人工插话开始新回合。
+
+已有记录缺少 `orchestration_backend` 时使用 legacy；缺少 `config.agent_backend` 时使用 direct，这两个默认互相独立。设置 `ORCHESTRATION_BACKEND=legacy` 只影响新建对话。可通过 `POST /api/conversations/<id>/orchestration` 和 `{"orchestration_backend":"langgraph"}` 或 `legacy` 显式切换已暂停的对话；须等工作线程、投票和总结退出，且没有未对账操作。完整消息、白板、调度游标、用量及预约一起迁移，不能直接回退到不支持这些字段的旧版本。
+
+迁移或回退前先暂停所有讨论、等后台操作结束并关闭服务，再备份整个 `data/`，同时包含业务库、检查点库及 DSH 文件。仅复制运行中的一个 SQLite 文件无法形成一致备份。此次代码重构的测试使用临时库，不批量迁移已有真实讨论。
+
+设计与验证细节见 [langgraph_plan.md](langgraph_plan.md)。
+
 ## 运行测试
 
 ```powershell
