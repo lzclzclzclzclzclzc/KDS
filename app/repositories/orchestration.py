@@ -290,10 +290,12 @@ class OrchestrationRepository:
                     raise RepositoryConflict("Pending command was changed")
                 payload = dict(payload, pending_human_message=None, pending_human_target=None)
             revision = self._save(conn, row, current, payload)
-            committed_snapshot = conn.execute("SELECT payload FROM conversations WHERE id = ?", (row["id"],)).fetchone()["payload"]
+            # The canonical snapshot and receipt commit atomically. Recovery uses
+            # the result/output and committed_rev, never a per-operation copy of
+            # the entire conversation. Keep the old column readable for imports.
             conn.execute(
-                "UPDATE orchestration_operations SET status = 'committed', committed_snapshot = ?, committed_rev = ?, updated_at = ? WHERE operation_id = ?",
-                (committed_snapshot, revision, db._now(), operation_id),
+                "UPDATE orchestration_operations SET status = 'committed', committed_rev = ?, updated_at = ? WHERE operation_id = ?",
+                (revision, db._now(), operation_id),
             )
             return revision
 
@@ -416,8 +418,8 @@ class OrchestrationRepository:
                     for operation_id, result in reconciled_summaries:
                         conn.execute(
                             "UPDATE orchestration_operations SET status = 'committed', result = ?, "
-                            "runner_epoch = ?, committed_snapshot = ?, committed_rev = ?, updated_at = ? WHERE operation_id = ?",
-                            (_encode(result), payload["runner_epoch"], _encode(dict(payload, state_rev=revision)), revision, now, operation_id),
+                            "runner_epoch = ?, committed_rev = ?, updated_at = ? WHERE operation_id = ?",
+                            (_encode(result), payload["runner_epoch"], revision, now, operation_id),
                         )
                     changed_ids.append(row["id"])
         return changed_ids
