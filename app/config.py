@@ -51,6 +51,17 @@ LANGGRAPH_CHECKPOINT_PATH = Path(os.getenv(
 )).expanduser()
 GRAPH_MAX_CONCURRENCY = max(1, _int("GRAPH_MAX_CONCURRENCY", 1))
 AUXILIARY_MAX_CONCURRENCY = max(1, _int("AUXILIARY_MAX_CONCURRENCY", 4))
+TEAM_DSH_MAX_CONCURRENCY = max(1, _int("TEAM_DSH_MAX_CONCURRENCY", 4))
+# Only server-defined profiles may be selected by a role or inherited by a child.
+# The default profile uses the existing DSH_* settings; secrets never enter a role.
+import json
+try:
+    TEAM_MODEL_CONFIGS = json.loads(os.getenv('TEAM_MODEL_CONFIGS', '{}'))
+    if not isinstance(TEAM_MODEL_CONFIGS, dict):
+        TEAM_MODEL_CONFIGS = {}
+except ValueError:
+    TEAM_MODEL_CONFIGS = {}
+TEAM_MODEL_CONFIGS.setdefault('default', {})
 
 # Discussion turns use Harness; auxiliary scoring/voting keep the LLM_* route.
 AGENT_BACKEND = os.getenv("AGENT_BACKEND", "dsh").strip().lower()

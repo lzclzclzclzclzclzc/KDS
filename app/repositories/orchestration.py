@@ -367,10 +367,12 @@ class OrchestrationRepository:
         changed_ids = []
         with self._transaction() as conn:
             now = db._now()
-            conn.execute("UPDATE orchestration_attempts SET status = 'uncertain', error = ?, updated_at = ? WHERE status = 'running'",
+            conn.execute("UPDATE orchestration_attempts SET status = 'uncertain', error = ?, updated_at = ? WHERE status = 'running' AND operation_id IN (SELECT operation_id FROM orchestration_operations WHERE kind NOT LIKE 'team_%')",
                          (_encode("服务重启，调用结果不确定"), now))
             for row in conn.execute("SELECT * FROM conversations").fetchall():
                 payload = json.loads(row["payload"])
+                if payload.get('kind') == 'team':
+                    continue
                 operations = conn.execute("SELECT * FROM orchestration_operations WHERE conversation_id = ? AND status NOT IN ('committed', 'abandoned') AND recovered_at IS NULL", (row["id"],)).fetchall()
                 changed = bool(operations)
                 reconciled_summaries = []

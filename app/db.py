@@ -27,6 +27,17 @@ def init_db(db_path: Path = DB_PATH) -> None:
     with _lock:
         conn = _connect(db_path)
         try:
+            # The first team migration keeps a consistent SQLite backup of an
+            # existing business database. New/temporary databases need none.
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if 'conversations' in tables and 'team_sessions' not in tables:
+                backup_path = db_path.with_name(db_path.stem + '.before-team-v1.db')
+                if not backup_path.exists():
+                    backup_conn = sqlite3.connect(str(backup_path))
+                    try:
+                        conn.backup(backup_conn)
+                    finally:
+                        backup_conn.close()
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS configs (
@@ -53,6 +64,8 @@ def init_db(db_path: Path = DB_PATH) -> None:
             )
             from app.migrations.langgraph_v1 import migrate
             migrate(conn)
+            from app.migrations.team_v1 import migrate as migrate_teams
+            migrate_teams(conn)
             conn.commit()
         finally:
             conn.close()
@@ -239,6 +252,8 @@ def mark_stale_running_conversations() -> None:
             revision = _revision_update(conn)
             for row in rows:
                 payload = json.loads(row["payload"])
+                if payload.get("kind") == "team":
+                    continue
                 changed = False
                 if row["status"] == "running":
                     active_seconds = max(
