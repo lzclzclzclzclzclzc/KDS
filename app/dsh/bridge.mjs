@@ -1,6 +1,6 @@
 // KDS-owned SDK overlay. Uses the public Cordis services in dsh 0.1.5/0.1.7.
 // No additional npm dependency: Node builtins and injected host services only.
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 
 export const name = "kds-discussion";
 export const inject = ["systemPrompt", "tools"];
@@ -31,6 +31,14 @@ export function apply(ctx) {
     agent.cancel({ kind: "hook", reason });
   }
 
+  function yieldReason(state) {
+    if (!state.yield_file || !existsSync(state.yield_file)) return null;
+    const signal = JSON.parse(readFileSync(state.yield_file, "utf8"));
+    return signal.run_id === state.run_id && signal.task_id === state.task_id
+      && signal.tool === "kds_get_task_results" && signal.mode === "all"
+      && Array.isArray(signal.task_ids) && signal.task_ids.length ? "wait_children" : null;
+  }
+
   // Variable values are inserted literally (one expansion pass). This also
   // supports 0.1.5, before sections gained the interpolate:false option.
   ctx.systemPrompt.variable("kds_instructions", () => control().system);
@@ -51,7 +59,7 @@ export function apply(ctx) {
 
   ctx.on("agent/pre-step", async ({ agent }, next) => {
     const state = control();
-    const reason = state.cancel || (steps >= state.max_steps ? "steps" : null);
+    const reason = state.cancel || yieldReason(state) || (steps >= state.max_steps ? "steps" : null);
     if (reason) {
       stop(reason, agent);
       return { kind: "reject" };
@@ -63,7 +71,9 @@ export function apply(ctx) {
 
   ctx.on("agent/request", async ({ agent }, next) => {
     const state = control();
-    const remaining = state.output_budget - output;
+    // Teams use null when no token cap applies; per-request model limits,
+    // cancellation, steps and time remain bounded independently.
+    const remaining = state.output_budget == null ? Infinity : state.output_budget - output;
     if (remaining <= 0) {
       stop(state.output_budget_reason, agent);
       throw new Error("KDS：本轮输出预算已用完");
@@ -77,7 +87,7 @@ export function apply(ctx) {
   ctx.tools.guard((execution) => {
     const state = control();
     if (!state.tools.includes(execution.name)) return "KDS：此角色未启用该工具";
-    const reason = state.cancel || (calls >= state.max_tool_calls ? "tools" : null);
+    const reason = state.cancel || yieldReason(state) || (calls >= state.max_tool_calls ? "tools" : null);
     if (reason) {
       if (execution.agent) stop(reason, execution.agent);
       return "KDS：本轮工具执行已停止";
@@ -103,8 +113,9 @@ export function apply(ctx) {
     const timer = setInterval(() => {
       try {
         const state = control();
-        if (state.cancel) for (const agent of agents) {
-          if (agent.status === "running") stop(state.cancel, agent);
+        const reason = state.cancel || yieldReason(state);
+        if (reason) for (const agent of agents) {
+          if (agent.status === "running") stop(reason, agent);
         }
       } catch {
         for (const agent of agents) if (agent.status === "running") {

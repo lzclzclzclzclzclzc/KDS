@@ -48,6 +48,20 @@ try {
   state = { ...state, run_id: "three", cancel: null };
   save();
   assert.equal((await handlers["agent/request"]({ agent }, async () => ({}))).maxTokens, 8);
+  state = { ...state, run_id: "unlimited", output_budget: null };
+  save();
+  handlers["session/event"](null, { type: "assistant/message", data: { usage: { outputTokens: 9000 } } });
+  assert.equal((await handlers["agent/request"]({ agent }, async () => ({ maxTokens: 100 }))).maxTokens, 8);
+  state = { ...state, run_id: "yield", task_id: "parent", yield_file: join(root, "yield.json") };
+  save();
+  writeFileSync(state.yield_file, JSON.stringify({ run_id: "stale", task_id: "parent", tool: "kds_get_task_results", task_ids: ["child"], mode: "all" }));
+  assert.equal((await handlers["agent/pre-step"]({ agent }, async () => ({ kind: "enter" }))).kind, "enter");
+  writeFileSync(state.yield_file, JSON.stringify({ run_id: "yield", task_id: "parent", tool: "kds_get_task_results", task_ids: ["child"], mode: "all" }));
+  assert.equal((await handlers["agent/pre-step"]({ agent }, () => { throw Error("pending child cannot poll"); })).kind, "reject");
+  assert.equal(cancellations.at(-1).reason, "wait_children");
+  state = { ...state, cancel: "manual" }; save();
+  assert.equal((await handlers["agent/pre-step"]({ agent }, async () => ({ kind: "enter" }))).kind, "reject");
+  assert.equal(cancellations.at(-1).reason, "manual");
   console.log("dsh bridge: budgets, tool restriction, prompt and cancellation passed");
 } finally {
   dispose?.();
