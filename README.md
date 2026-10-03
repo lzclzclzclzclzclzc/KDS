@@ -54,7 +54,7 @@
 
 ## DeepSeek Harness 讨论角色
 
-所有讨论角色通过官方 Python SDK 调用 dsh；发言意愿评分、投票、配置助手和最终总结通过 `LLM_*` 配置直连 DeepSeek。示例配置统一使用 DeepSeek API。
+旧群聊的讨论角色通过官方 Python SDK 调用 dsh；其发言意愿评分、投票、配置助手和最终总结通过 `LLM_*` 配置直连 DeepSeek。团队模式的 Agent 与辅助调用均使用 DSH，详见下方「图形化多 Agent 团队」。示例配置统一使用 DeepSeek API。
 
 ### 安装与配置
 
@@ -86,7 +86,7 @@ DSH_BASE_URL=https://api.deepseek.com/anthropic
 
 `DSH_BIN` 和 `DSH_BASE_URL` 同时留空即使用 SDK 配套运行时及 `DEEPSEEK_BASE_URL`。兼容验证覆盖配套 `0.1.5rc1` 与本机 npm `0.1.7-rc.2`；dsh 仍处于预览阶段，升级后应运行集成测试。较新的 dsh 使用 DeepSeek Messages 协议；自建代理需支持所选 dsh 版本的协议，不能仅因为支持 Chat Completions 就假定兼容。
 
-**两个协议使用不同地址。** 本机 0.1.7 DSH 需要 `DSH_BASE_URL=https://api.deepseek.com/anthropic`，实际请求 `/anthropic/v1/messages`；辅助调用使用 `LLM_BASE_URL=https://api.deepseek.com`。如果把普通根地址直接给新版 DSH，会请求不存在的 `/v1/messages` 并返回 404。`DSH_BASE_URL` 优先于 `DEEPSEEK_BASE_URL`，只覆盖 DSH 子进程，不影响辅助调用。完整示例见 [.env.dsh.example](.env.dsh.example)。端点依据：[DeepSeek 官方协议地址](https://api-docs.deepseek.com/quick_start/pricing/)。
+**两个协议使用不同地址。** 本机 0.1.7 DSH 需要 `DSH_BASE_URL=https://api.deepseek.com/anthropic`，实际请求 `/anthropic/v1/messages`；旧群聊的辅助调用使用 `LLM_BASE_URL=https://api.deepseek.com`。如果把普通根地址直接给新版 DSH，会请求不存在的 `/v1/messages` 并返回 404。`DSH_BASE_URL` 优先于 `DEEPSEEK_BASE_URL`，只覆盖 DSH 子进程，不影响旧群聊的直连辅助调用。完整示例见 [.env.dsh.example](.env.dsh.example)。端点依据：[DeepSeek 官方协议地址](https://api-docs.deepseek.com/quick_start/pricing/)。
 
 ### 回合与恢复行为
 
@@ -214,7 +214,51 @@ AUXILIARY_MAX_CONCURRENCY=4
 
 迁移或回退前先暂停所有讨论、等后台操作结束并关闭服务，再备份整个 `data/`，同时包含业务库、检查点库及 DSH 文件。仅复制运行中的一个 SQLite 文件无法形成一致备份。此次代码重构的测试使用临时库，不批量迁移已有真实讨论。
 
-设计与验证细节见 [langgraph_plan.md](langgraph_plan.md)。
+设计与验证细节见 [langgraph_plan.md](docs/langgraph_plan.md)。
+
+## 图形化多 Agent 团队
+
+首页新增「图形化 Agent 团队」入口，也可访问 `http://127.0.0.1:5000/teams`。
+在角色库保存版本，把角色放到画板，分别绘制父子任务有向边和群聊双向边。
+同一模板可以建立多个独立实例；单节点团队也能启动。运行冻结配置版本，后续编辑下次生效。
+
+角色库提供 9 个通用角色预设，团队选择提供 CAMEL、AutoGen、MetaGPT 与多 Agent 辩论启发的 4 个配置。
+预设展示论文链接并保存来源，添加后可按普通版本编辑；具体职责、拓扑及改编差异见 [team-presets.md](docs/team-presets.md)。
+工具权限从服务器启用的有限目录勾选，支持全选；角色及运行单次输出留空表示无限，仍受总额度、时长和父任务显式限制约束。
+一对节点最多选择一种连线。编辑和观察界面的左右侧栏均可拖动分隔条调整宽度，并分别记住设置。
+
+团队模式通过独立 LangGraph 激活、持久化邮箱和 DSH 编排工具执行委派、临时角色创建、等待、结果回传和有限讨论。
+配置建议、评分、投票、总结及格式修正也走 DSH；`LLM_MOCK=true` 明确启用离线模拟，不请求真实模型。
+向单个 Agent 发送消息只补充信息，不派发任务、不解除等待；只有人工「总结并完成」才完成整场运行。
+
+默认使用已有 `DSH_*` 配置，角色的 `model_config_id=default` 指向该配置。
+`TEAM_DSH_MAX_CONCURRENCY`（默认 4）限制整个应用的团队 DSH 调用；每次运行另有限制执行并发、进程、层级、实例、任务与讨论回合。
+可在服务器的 `TEAM_MODEL_CONFIGS` JSON 环境变量中注册其他 DSH 配置引用；角色定义和浏览器不会收到 API 密钥。
+应用使用数据库旁的进程锁，团队调度只支持单个应用进程，使用多个 Flask worker 会被拒绝。
+
+首次升级已有业务库前自动建立 `data/kds.before-team-v1.db` 一致备份，迁移保持幂等。
+检查点继续使用既有独立数据库。启动后遗留团队运行只暂停、对账，不自动调用模型。
+出现不确定外部调用时需核对副作用并明确重试；暂停和停机不计入运行时长，重启时间恢复精度为最近持久进度（至多约一秒残余）。
+
+使用说明见 [teams-guide.md](docs/teams-guide.md)，设计核对与实际验证见 [graphical-multi-agent-validation.md](docs/graphical-multi-agent-validation.md)。
+
+启动方式仍为 `.\.venv\Scripts\python.exe run.py`。修改代码或切换分支后需要先结束旧 KDS 服务再启动；默认关闭自动热更新。
+若 `/teams` 返回 404，确认地址端口与启动输出一致、当前目录和分支正确，并确认旧服务已退出。
+
+离线端到端浏览器预览使用临时数据库，不改变已有讨论：
+
+```powershell
+.\.venv\Scripts\python.exe tests/team_preview_server.py
+# 另一个终端；需要可用的 Playwright 和 Chromium
+$env:KDS_TEAM_UI_URL = 'http://127.0.0.1:5017'
+node tests/test_team_service_ui.cjs
+```
+
+团队容量样本：
+
+```powershell
+.\.venv\Scripts\python.exe scripts/benchmark_teams.py --instances 8 --concurrency 1 3
+```
 
 ## 运行测试
 

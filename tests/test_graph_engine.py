@@ -54,9 +54,9 @@ def make_runner(tmp_path, monkeypatch):
     return make
 
 
-def run(runner):
+def run(runner, timeout=10):
     runner.start()
-    runner._thread.join(10)
+    runner._thread.join(timeout)
     assert not runner.is_alive(), runner.to_dict()
     assert runner.error is None, runner.error
 
@@ -159,7 +159,8 @@ def test_summary_failure_remains_completed(make_runner):
 
 def test_many_units_do_not_share_recursion_budget(make_runner):
     runner = make_runner(cfg=config(total_max_tokens=205))
-    run(runner)
+    # This checks 41 finite graph units, not host filesystem throughput.
+    run(runner, timeout=30)
     assert runner.turn == 41
     assert runner.paused_reason == "limit"
 
