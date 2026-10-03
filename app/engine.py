@@ -11,7 +11,7 @@ from app.harness import HarnessManager, HarnessTurnError
 from app.llm import LLMClient
 from app.scheduler import update_heat, willingness_select
 from app.domain import context, whiteboard
-from app.tool_logs import MAX_TOOL_LOGS, tool_log_index
+from app.tool_logs import MAX_TOOL_LOGS, merge_tool_log, tool_log_index
 
 
 def _now() -> str:
@@ -519,7 +519,7 @@ class ConversationRunner:
                     existing = {"id": log["id"], "agent_id": activity["agent_id"],
                                 "agent_name": activity["agent_name"], "turn": self.turn + 1}
                     self.harness_logs.append(existing)
-                existing.update(log)
+                existing.update(merge_tool_log(existing, log))
                 overflow = max(0, len(self.harness_logs) - MAX_TOOL_LOGS)
                 if overflow:
                     del self.harness_logs[:overflow]

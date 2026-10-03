@@ -301,7 +301,7 @@ class HarnessManager:
             if event_type in {"step/start", "tool/call", "tool/result"}:
                 progress = dict(activity)
                 log = tool_log_update(event, control["run_id"],
-                                      (self.settings.api_key, config.LLM_API_KEY))
+                                      (self.settings.api_key, config.LLM_API_KEY), session_id=payload.get("sessionId"))
                 if log is not None:
                     progress["tool_log"] = log
                 on_progress(progress)

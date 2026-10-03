@@ -6,7 +6,7 @@ from flask import Flask
 import app.db as db
 from app.engine import ConversationRunner
 from app.llm import LLMClient
-from app.tool_logs import MAX_TOOL_LOGS, log_text, tool_log_update
+from app.tool_logs import MAX_TOOL_LOGS, log_text, merge_tool_log, tool_log_update
 from test_harness import FakeRuntime, make_manager
 from test_review_fixes import _api_module
 
@@ -62,6 +62,34 @@ def test_identity_separates_parallel_calls_steps_and_repeated_turns():
         (call(), "one"), (call("c2"), "one"), (call(step=2), "one"), (call(), "two"),
     ]}
     assert len(keys) == 4
+
+
+def test_session_identity_keeps_legitimate_repeated_arguments_and_matches_result():
+    first = tool_log_update(call(), "activation", session_id="session-a")
+    second = tool_log_update(call("c2"), "activation", session_id="session-a")
+    other_session = tool_log_update(call(), "activation", session_id="session-b")
+    final = result()
+    final["sourceEventSeqs"] = [1]
+    completed = tool_log_update(final, "activation", session_id="session-a")
+    assert len({row["id"] for row in (first, second, other_session)}) == 3
+    assert first["arguments"] == second["arguments"] == other_session["arguments"]
+    assert completed["id"] == first["id"]
+    assert completed["call_id"] == "c1" and completed["session_id"] == "session-a"
+    assert completed["call_event_seq"] == 1 and completed["result_event_seq"] == 2
+    merged = merge_tool_log(completed, first)
+    assert merged["status"] == "completed" and merged["result"] == "verified-answer=42"
+    assert merged["arguments"] == first["arguments"]
+
+
+def test_legacy_engine_does_not_reopen_a_call_when_start_is_replayed_late():
+    value = runner()
+    progress(value, result())
+    progress(value, call())
+    progress(value, call("c2"))
+    assert len(value.harness_logs) == 2
+    assert value.harness_logs[0]["status"] == "completed"
+    assert value.harness_logs[0]["tool"] == "read"
+    assert value.harness_logs[1]["status"] == "running"
 
 
 def test_secrets_are_masked_before_bounded_display():
