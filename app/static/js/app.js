@@ -159,6 +159,7 @@
           <p>让多个 LLM 按预设背景和 system prompt 无限畅聊</p>
           <div class="start-actions">
             <button class="btn btn-primary" data-go="config">＋ 新建配置</button>
+            <a class="btn btn-primary" href="/teams">图形化 Agent 团队 ↗</a>
           </div>
         </div>
         <div class="section-title">历史对话</div>
@@ -223,6 +224,10 @@
     list.querySelectorAll(".list-item").forEach((el) => {
       el.addEventListener("click", (e) => {
         if (e.target.closest("[data-del]")) return;
+        if (convItems.find(c => c.id === el.dataset.id)?.kind === "team") {
+          location.href = "/teams#/run/" + encodeURIComponent(el.dataset.id);
+          return;
+        }
         location.hash = "#/chat/" + el.dataset.id;
       });
     });
@@ -1109,6 +1114,11 @@
       const includeLogs = app.querySelectorAll(".tool-log-group[open]").length > 0;
       const conv = await api("/api/conversations/" + requestedId + (includeLogs ? "?tool_logs=1" : ""));
       if (requestedId !== chatConvId) return;
+      if (conv.kind === "team") {
+        clearChatTimer();
+        location.href = "/teams#/run/" + encodeURIComponent(requestedId);
+        return;
+      }
       if (chatConv && !conv.harness_logs && chatConv.harness_log_rev === conv.harness_log_rev) {
         conv.harness_logs = chatConv.harness_logs;
       }

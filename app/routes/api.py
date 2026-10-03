@@ -211,6 +211,7 @@ def conversations_list():
         items.append(
             {
                 "id": c["id"],
+                "kind": c.get('kind','conversation'),
                 "config_id": c["config_id"],
                 "name": c["name"],
                 "status": c["status"],

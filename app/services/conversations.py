@@ -20,6 +20,8 @@ class ConversationService:
             if runner is not None:
                 return runner, None
             record = (get_record or db.get_conversation)(conv_id)
+            if record and record.get('kind') == 'team':
+                return None, record
             if record is None or record.get("status") not in statuses:
                 return None, record
             if record.get("orchestration_backend", "legacy") == "langgraph":
@@ -31,6 +33,10 @@ class ConversationService:
             return runner, record
 
     def delete(self, conv_id):
+        record = db.get_conversation(conv_id)
+        if record and record.get('kind') == 'team':
+            from app.services.team_sessions import team_service
+            return team_service.delete(conv_id)
         with RUNNERS_LOCK:
             runner = RUNNERS.get(conv_id)
             if runner is not None and hasattr(runner, "delete"):
@@ -57,6 +63,8 @@ class ConversationService:
             record = db.get_conversation(conv_id)
             if record is None:
                 return None
+            if record.get('kind') == 'team':
+                raise ValueError('团队运行请使用团队观察台，不能迁移到旧群聊引擎')
             old = RUNNERS.get(conv_id)
             if old is not None:
                 with old._lock:
